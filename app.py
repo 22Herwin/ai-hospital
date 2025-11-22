@@ -1,50 +1,42 @@
 from dotenv import load_dotenv
 import streamlit as st
-import pandas as pd, numpy as np, joblib, os, datetime, time
-from typing import Any, Dict
-from supabase_client import (
-    init_supabase_client, 
-    insert_admission_supabase, 
-    decrement_medicine_stock_supabase, 
-    update_admission_supabase, 
-    get_supabase_status,
-    replenish_medicine_stock_supabase
-)
+import pandas as pd
+import numpy as np
+import joblib
+import os
+import datetime
+import time
+from typing import Any, Dict, List, Tuple
+import subprocess, sys
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+# load .env
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Add diagnosis mapping
+# Model & data dirs
+DATA_DIR = os.path.join(BASE_DIR, "data")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+STOCK_CSV = os.path.join(DATA_DIR, "medicine_stock.csv")
+PATIENTS_LOG = os.path.join(DATA_DIR, "admission_log.csv")
+
+# DIAGNOSIS_MAPPING (keep synchronized with generator/train)
 DIAGNOSIS_MAPPING = {
-    'D01': {
-        'name': 'Pneumonia',
-        'description': 'Lung infection causing inflammation and fluid buildup',
-        'medicines': ['Amoxicillin 500mg', 'Azithromycin 250mg', 'Paracetamol 500mg']
-    },
-    'D02': {
-        'name': 'Hypertensive Heart Disease',
-        'description': 'Heart damage due to chronic high blood pressure',
-        'medicines': ['Amlodipine 5mg', 'Lisinopril 10mg', 'Atorvastatin 20mg']
-    },
-    'D03': {
-        'name': 'Type 2 Diabetes',
-        'description': 'Metabolic disorder causing high blood sugar levels',
-        'medicines': ['Metformin 500mg', 'Insulin Glargine', 'Sitagliptin 100mg']
-    },
-    'D04': {
-        'name': 'Influenza',
-        'description': 'Viral respiratory infection with high fever',
-        'medicines': ['Oseltamivir 75mg', 'Paracetamol 500mg', 'Dexamethasone 4mg']
-    },
-    'D05': {
-        'name': 'Stroke',
-        'description': 'Sudden loss of blood flow to the brain',
-        'medicines': ['Aspirin 81mg', 'Clopidogrel 75mg', 'Atorvastatin 40mg']
-    },
-    'D06': {
-        'name': 'Gastroenteritis',
-        'description': 'Inflammation of stomach and intestines',
-        'medicines': ['Ondansetron 4mg', 'Loperamide 2mg', 'Oral Rehydration Salts']
-    }
+    'D01': {'name':'Heart Failure Exacerbation','description':'Acute worsening of chronic heart failure','medicines':['Furosemide 40mg IV','Carvedilol 6.25mg','Spironolactone 25mg']},
+    'D02': {'name':'COPD Exacerbation with Respiratory Failure','description':'Severe COPD flare','medicines':['Methylprednisolone 40mg IV','Levofloxacin 750mg','Albuterol Nebulizer']},
+    'D03': {'name':'Sepsis with Multi-organ Dysfunction','description':'Systemic infection with organ failure','medicines':['Vancomycin 15mg/kg IV','Piperacillin-Tazobactam 4.5g IV','Norepinephrine infusion']},
+    'D04': {'name':'Stroke with Rehabilitation Needs','description':'Cerebrovascular accident requiring rehab','medicines':['Aspirin 325mg','Atorvastatin 80mg','Clopidogrel 75mg']},
+    'D05': {'name':'Pancreatitis with Complications','description':'Severe pancreatitis with complications','medicines':['Pantoprazole 40mg IV','Morphine PCA','Octreotide infusion']},
+    'D06': {'name':'Pneumonia (Community Acquired)','description':'Bacterial lung infection','medicines':['Ceftriaxone 1g IV','Azithromycin 500mg IV','Oxygen therapy']},
+    'D07': {'name':'UTI with Sepsis','description':'Urinary tract infection with systemic response','medicines':['Ceftriaxone 2g IV','Gentamicin 5mg/kg IV','IV Fluids']},
+    'D08': {'name':'Hypertensive Crisis','description':'Severe hypertension requiring urgent BP lowering','medicines':['Labetalol infusion','Nicardipine drip','Hydralazine 10mg IV']},
+    'D09': {'name':'Diabetic Ketoacidosis (Resolved)','description':'Metabolic emergency treated with insulin and fluids','medicines':['Insulin infusion','Potassium replacement','IV Fluids']},
+    'D10': {'name':'Cellulitis with Systemic Symptoms','description':'Skin infection with systemic features','medicines':['Vancomycin 15mg/kg IV','Clindamycin 600mg IV','Wound care']},
+    'D11': {'name':'Upper Respiratory Infection','description':'Usually viral, supportive care','medicines':['Paracetamol 500mg','Dextromethorphan 15mg','Saline nasal spray']},
+    'D12': {'name':'Hypertension Management','description':'Chronic blood pressure management','medicines':['Amlodipine 5mg','Lisinopril 10mg','Hydrochlorothiazide 12.5mg']},
+    'D13': {'name':'Type 2 Diabetes Follow-up','description':'Diabetes monitoring and medication adjustments','medicines':['Metformin 1000mg','Sitagliptin 100mg','Glipizide 5mg']},
+    'D14': {'name':'Gastroenteritis','description':'Stomach/intestine inflammation, usually self-limited','medicines':['Ondansetron 4mg','Loperamide 2mg','Oral Rehydration Salts']},
+    'D15': {'name':'Back Pain','description':'Musculoskeletal back pain','medicines':['Ibuprofen 400mg','Cyclobenzaprine 5mg','Acetaminophen 650mg']},
+    'D16': {'name':'Well Visit','description':'Routine check-up','medicines':[]}
 }
 
 # safe rerun helper
@@ -57,13 +49,7 @@ def safe_rerun():
 
 st.set_page_config(page_title='AI Hospital Management System', layout='wide')
 
-BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-MODELS_DIR = os.path.join(BASE_DIR, 'models')
-STOCK_CSV = os.path.join(DATA_DIR, 'medicine_stock.csv')
-PATIENTS_LOG = os.path.join(DATA_DIR, 'admission_log.csv')
-
-# Initialize session state
+# session state init
 if 'current_patient' not in st.session_state:
     st.session_state.current_patient = None
 if 'admission_complete' not in st.session_state:
@@ -71,674 +57,430 @@ if 'admission_complete' not in st.session_state:
 if 'last_admission_id' not in st.session_state:
     st.session_state.last_admission_id = None
 
+# utility to load stock CSV
 @st.cache_resource
 def load_stock():
     try:
         df = pd.read_csv(STOCK_CSV)
         df['stock'] = pd.to_numeric(df['stock'], errors='coerce').fillna(0).astype(int)
         return df
-    except Exception as e:
-        st.error(f"Error loading stock: {str(e)}")
-        return pd.DataFrame(columns=['medicine_name', 'stock'])
+    except Exception:
+        # create default demo stock if not present
+        meds = []
+        for v in DIAGNOSIS_MAPPING.values():
+            meds.extend(v.get('medicines', []))
+        meds = sorted(list(set(meds)))
+        df = pd.DataFrame({'medicine_name': meds, 'stock': [10]*len(meds)})
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df.to_csv(STOCK_CSV, index=False)
+        df['stock'] = df['stock'].astype(int)
+        return df
 
-def save_stock(df):
+def save_stock(df: pd.DataFrame):
     try:
         df.to_csv(STOCK_CSV, index=False)
+        # clear cached loader so updates are visible next render
+        load_stock.clear()
         return True
     except Exception as e:
-        st.error(f"Error saving stock: {str(e)}")
+        st.error(f"Error saving stock: {e}")
         return False
 
-# New: lightweight fallback diagnosis model (rule-based)
+# fallback diagnosis rule-based (keeps app functional when model missing)
 class FallbackDiagnosisModel:
     def predict(self, X):
-        # X is a DataFrame-like with one row
         row = X.iloc[0]
-        # Simple rules to map to diagnosis codes
-        if row.get('symptom_cough', 0) and row.get('symptom_fever', 0) and row.get('lab_wbc', 0) > 11:
-            return ['D01']  # Pneumonia
-        if row.get('comorbidity_hypertension', 0) and row.get('age', 0) > 60:
-            return ['D02']  # Hypertensive Heart Disease
-        if row.get('comorbidity_diabetes', 0):
-            return ['D03']  # Type 2 Diabetes
-        if row.get('symptom_fever', 0) and row.get('symptom_cough', 0) and row.get('temperature', 0) > 38:
-            return ['D04']  # Influenza
-        if row.get('symptom_breathless', 0) and (row.get('blood_pressure_sys', 0) > 180 or row.get('heart_rate', 0) > 120):
-            return ['D05']  # Stroke (proxy)
-        return ['D06']  # Gastroenteritis / default
-
-    def predict_proba(self, X):
-        # Return a single-column probability array with reasonable confidence for the selected label
-        # The code only takes max(proba) so shape/details are flexible
+        if row.get('symptom_cough',0) and row.get('symptom_fever',0) and row.get('lab_wbc',0) > 11:
+            return ['D06']
+        if row.get('comorbidity_hypertension',0) and row.get('age',0) > 60:
+            return ['D01']
+        if row.get('comorbidity_diabetes',0) and row.get('lab_crp',0) > 20:
+            return ['D09']
+        if row.get('symptom_breathless',0) and row.get('temperature',0) > 38:
+            return ['D02']
+        return ['D16']
+    def predict_proba(self, X) -> np.ndarray:
+        # return shape (n_samples, n_classes_like) — simple single-column confidence
         n = len(X)
-        # give moderate confidence
-        return np.array([[0.65] for _ in range(n)])
-def load_models():
+        return np.ones((n, 1), dtype=float) * 0.75
+
+def load_models() -> Dict[str, Any]:
     models: Dict[str, Any] = {
-        'inpatient': None, 
-        'ward': None, 
+        'diagnosis': None,
+        'inpatient': None,
+        'ward': None,
         'stay': None,
-        'diagnosis': None
+        'medicine': None  # medicine model will be a dict {'pipeline':..., 'mlb':...}
     }
-    model_files = {
-        'inpatient': 'inpatient_model.pkl',
-        'ward': 'ward_model.pkl',
-        'stay': 'stay_model.pkl',
-        'diagnosis': 'diagnosis_model.pkl'
-    }
-    
-    for name, filename in model_files.items():
+    # Try to load
+    try:
+        models['diagnosis'] = joblib.load(os.path.join(MODELS_DIR, 'diagnosis_model.pkl'))
+        st.sidebar.success("Diagnosis model loaded")
+    except Exception:
+        models['diagnosis'] = FallbackDiagnosisModel()
+        st.sidebar.warning("Diagnosis model not found, using fallback rules")
+
+    for name in ['inpatient','ward','stay']:
         try:
-            models[name] = joblib.load(os.path.join(MODELS_DIR, filename))
+            models[name] = joblib.load(os.path.join(MODELS_DIR, f'{name}_model.pkl'))
             st.sidebar.success(f"{name.capitalize()} model loaded")
-        except Exception as e:
-            # If diagnosis model missing, provide a fallback rule-based model to keep app functional
-            if name == 'diagnosis':
-                models[name] = FallbackDiagnosisModel()
-                st.sidebar.warning(f"Diagnosis model not found; using fallback rule-based predictor ({filename}).")
-            else:
-                models[name] = None
-                st.sidebar.error(f"Failed to load {name} model: {str(e)}")
-    return models
-    return models
+        except Exception:
+            models[name] = None
+            st.sidebar.info(f"{name.capitalize()} model not found")
 
-# Sidebar configuration
-st.sidebar.header('System Configuration')
-db = init_supabase_client()
-ok, msg = get_supabase_status()
-st.sidebar.write(f"**Supabase Status:** {'Connected' if ok else 'Disconnected'}")
-st.sidebar.caption(msg)
-
-if st.sidebar.button('Refresh Models'):
-    st.cache_resource.clear()
-    safe_rerun()
-
-models = load_models()
-
-# Dataset generation and training controls
-st.sidebar.markdown("---")
-st.sidebar.subheader("Data Management")
-if st.sidebar.button('Generate Sample Dataset (1000 rows)'):
-    with st.spinner("Generating sample dataset..."):
-        import subprocess, sys
-        subprocess.run([
-            sys.executable, 
-            os.path.join(BASE_DIR, 'generate_dataset.py'),
-            '--n', '1000',
-            '--out', os.path.join(DATA_DIR, 'patients_sample.csv')
-        ])
-    st.sidebar.success('Dataset generated successfully!')
-
-if st.sidebar.button('Train Prediction Models'):
-    with st.spinner("Training models (this may take 2-5 minutes)..."):
-        import subprocess, sys
-        result = subprocess.run([
-            sys.executable,
-            os.path.join(BASE_DIR, 'train_models.py'),
-            '--data', os.path.join(DATA_DIR, 'patients_sample.csv'),
-            '--out_dir', MODELS_DIR
-        ], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            st.sidebar.success('Training completed successfully!')
-            st.cache_resource.clear()
-            safe_rerun()
+    try:
+        med_obj = joblib.load(os.path.join(MODELS_DIR, 'medicine_model.pkl'))
+        # medicine_model.pkl stored as dict {'pipeline':..., 'mlb':...}
+        if isinstance(med_obj, dict) and 'pipeline' in med_obj and 'mlb' in med_obj:
+            models['medicine'] = med_obj
+            st.sidebar.success("Medicine recommender loaded")
         else:
-            st.sidebar.error(f"Training failed: {result.stderr}")
+            st.sidebar.warning("Medicine model file content unexpected")
+    except Exception:
+        models['medicine'] = None
+        st.sidebar.info("Medicine recommender not found; will use DIAGNOSIS_MAPPING fallback")
 
-# Main content
-st.title('AI Hospital Management System')
-st.markdown("### Patient Admission & Resource Management")
+    return models
+
+# explicit typing here helps the static checker later when we call predict / named_steps / etc.
+models: Dict[str, Any] = load_models()
+
+# helper: engineered feature generator (must match train/generate)
+def engineered_flags_from_features(features: dict) -> dict:
+    flags = {}
+    flags['is_respiratory'] = int((features.get('symptom_cough',0) == 1) or (features.get('symptom_breathless',0) == 1))
+    flags['is_infection'] = int((features.get('symptom_fever',0) == 1) and (features.get('lab_crp',0) > 20 or features.get('lab_wbc',0) > 11))
+    flags['is_cardiac'] = int((features.get('comorbidity_hypertension',0) == 1) or (features.get('blood_pressure_sys',0) > 160) or (features.get('heart_rate',0) > 110))
+    flags['is_metabolic'] = int(features.get('comorbidity_diabetes',0) == 1)
+    flags['is_neuro'] = 0
+    flags['is_gi'] = int(features.get('diagnosis_code','') in ['D05','D14'])
+    flags['age_over_65'] = int(features.get('age',0) > 65)
+    return flags
+
+# Calculate severity score (same logic used in dataset and training)
+def calc_severity_score(features: dict) -> int:
+    score = 0
+    if features['blood_pressure_sys'] > 180 or features['blood_pressure_sys'] < 90: score += 2
+    if features['blood_pressure_dia'] > 120 or features['blood_pressure_dia'] < 60: score += 2
+    if features['heart_rate'] > 120 or features['heart_rate'] < 50: score += 2
+    if features['temperature'] > 39.0: score += 2
+    if features['symptom_cough'] or features['symptom_fever'] or features['symptom_breathless']: score += 1
+    if features['symptom_cough'] and features['symptom_fever']: score += 1
+    if features['symptom_cough'] and features['symptom_breathless']: score += 1
+    if features['symptom_fever'] and features['symptom_breathless']: score += 2
+    if features['lab_wbc'] > 15.0: score += 3
+    elif features['lab_wbc'] > 11.0: score += 2
+    if features['lab_crp'] > 50: score += 3
+    elif features['lab_crp'] > 20: score += 2
+    elif features['lab_crp'] > 10: score += 1
+    if features['comorbidity_diabetes']: score += 1
+    if features['comorbidity_hypertension']: score += 1
+    if features['age'] > 65: score += 1
+    return score
+
+# Sidebar controls
+st.sidebar.header("System Controls")
+if st.sidebar.button("Refresh Models"):
+    # clear cached resources used by app so models/stock reload on rerun
+    load_stock.clear()
+    safe_rerun()
+if st.sidebar.button("Generate Sample Dataset (1k)"):
+    with st.spinner("Generating dataset..."):
+        subprocess.run([sys.executable, os.path.join(BASE_DIR,'generate_dataset.py'), '--n','1000','--out',os.path.join(DATA_DIR,'patients_sample.csv')])
+    st.sidebar.success("Dataset generated")
+if st.sidebar.button("Train Models"):
+    with st.spinner("Training models..."):
+        subprocess.run([sys.executable, os.path.join(BASE_DIR,'train_models.py'),'--data',os.path.join(DATA_DIR,'patients_sample.csv'),'--out_dir',MODELS_DIR])
+    st.sidebar.success("Training triggered - refresh models after complete")
+
+st.title("Hospital Management System")
+st.markdown("Patient admission, diagnosis, ward/stay predictions, and medicine recommendations.")
 
 # Patient input form
-with st.form('patient_form'):
+with st.form("patient_form"):
     st.subheader("Patient Clinical Profile")
     col1, col2, col3 = st.columns(3)
-    
     with col1:
-        pid = st.text_input('Patient ID', value=f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
-        age = st.number_input('Age', min_value=0, max_value=120, value=45)
-        sex = st.selectbox('Biological Sex', ['M', 'F', 'Other'])
-        bmi = st.number_input('BMI', value=24.0, step=0.1, min_value=10.0, max_value=60.0)
-    
+        pid = st.text_input("Patient ID", value=f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
+        age = st.number_input("Age", min_value=0, max_value=120, value=45)
+        sex = st.selectbox("Sex", ['M','F','Other'])
+        bmi = st.number_input("BMI", value=24.0, step=0.1, min_value=10.0, max_value=60.0)
     with col2:
-        st.subheader("Vital Signs")
-        bp_sys = st.number_input('Systolic BP (mmHg)', value=120, min_value=70, max_value=250)
-        bp_dia = st.number_input('Diastolic BP (mmHg)', value=80, min_value=40, max_value=150)
-        hr = st.number_input('Heart Rate (bpm)', value=78, min_value=30, max_value=200)
-        temp = st.number_input('Temperature (°C)', value=36.7, step=0.1, min_value=30.0, max_value=42.0)
-    
+        st.subheader("Vitals")
+        bp_sys = st.number_input("Systolic BP (mmHg)", value=120, min_value=70, max_value=250)
+        bp_dia = st.number_input("Diastolic BP (mmHg)", value=80, min_value=40, max_value=150)
+        hr = st.number_input("Heart Rate (bpm)", value=78, min_value=30, max_value=200)
+        temp = st.number_input("Temperature (°C)", value=36.7, step=0.1, min_value=30.0, max_value=42.0)
     with col3:
-        st.subheader("Clinical Indicators")
-        cough = st.checkbox('Cough')
-        fever = st.checkbox('Fever (>38°C)')
-        breathless = st.checkbox('Breathlessness')
-        diabetes = st.checkbox('Diabetes')
-        hypertension = st.checkbox('Hypertension')
-        wbc = st.number_input('WBC Count (10^9/L)', value=7.0, step=0.1, min_value=0.0, max_value=50.0)
-        crp = st.number_input('CRP Level (mg/L)', value=5.0, step=0.1, min_value=0.0, max_value=300.0)
-    
-    submitted = st.form_submit_button('Analyze Patient Risk')
+        st.subheader("Clinical Indicators & Labs")
+        cough = st.checkbox("Cough")
+        fever = st.checkbox("Fever (>38°C)")
+        breathless = st.checkbox("Breathlessness")
+        diabetes = st.checkbox("Diabetes")
+        hypertension = st.checkbox("Hypertension")
+        wbc = st.number_input("WBC Count (10^9/L)", value=7.0, step=0.1, min_value=0.0, max_value=50.0)
+        crp = st.number_input("CRP Level (mg/L)", value=5.0, step=0.1, min_value=0.0, max_value=300.0)
+    submitted = st.form_submit_button("Analyze Patient")
 
 if submitted:
-    # Calculate severity score - more clinically accurate
-    severity_score = 0
-    
-    # Vital signs assessment
-    if bp_sys > 180 or bp_sys < 90: severity_score += 2
-    if bp_dia > 120 or bp_dia < 60: severity_score += 2
-    if hr > 120 or hr < 50: severity_score += 2
-    if temp > 39.0: severity_score += 2
-    
-    # Symptom assessment
-    if cough or fever or breathless: severity_score += 1
-    if cough and fever: severity_score += 1
-    if cough and breathless: severity_score += 1
-    if fever and breathless: severity_score += 2
-    
-    # Lab values
-    if wbc > 15.0: severity_score += 3
-    elif wbc > 11.0: severity_score += 2
-    if crp > 50: severity_score += 3
-    elif crp > 20: severity_score += 2
-    elif crp > 10: severity_score += 1
-    
-    # Comorbidities
-    if diabetes: severity_score += 1
-    if hypertension: severity_score += 1
-    if age > 65: severity_score += 1
-    
-    # Prepare features for prediction
-    features = pd.DataFrame([{
-        'age': age, 
-        'bmi': bmi, 
-        'blood_pressure_sys': bp_sys, 
-        'blood_pressure_dia': bp_dia,
-        'heart_rate': hr, 
-        'temperature': temp,
-        'symptom_cough': int(cough),
-        'symptom_fever': int(fever),
-        'symptom_breathless': int(breathless),
-        'comorbidity_diabetes': int(diabetes),
-        'comorbidity_hypertension': int(hypertension),
-        'lab_wbc': wbc,
-        'lab_crp': crp,
-        'severity_score': severity_score
-    }])
-    
-    # Store in session state
+    # Build feature dict
+    features = {
+        'age': int(age), 'bmi': float(bmi),
+        'blood_pressure_sys': int(bp_sys), 'blood_pressure_dia': int(bp_dia),
+        'heart_rate': int(hr), 'temperature': float(temp),
+        'symptom_cough': int(cough), 'symptom_fever': int(fever), 'symptom_breathless': int(breathless),
+        'comorbidity_diabetes': int(diabetes), 'comorbidity_hypertension': int(hypertension),
+        'lab_wbc': float(wbc), 'lab_crp': float(crp)
+    }
+    severity_score = calc_severity_score(features)
+    features['severity_score'] = severity_score
+    # engineered flags
+    flags = engineered_flags_from_features(features)
+    features.update(flags)
+
     st.session_state.current_patient = {
         'pid': pid,
         'features': features,
         'severity_score': severity_score,
         'timestamp': datetime.datetime.now()
     }
-    
     st.session_state.admission_complete = False
     safe_rerun()
 
-# Display analysis results if patient data exists
+# Display results when available
 if st.session_state.current_patient and not st.session_state.admission_complete:
     patient = st.session_state.current_patient
-    features = patient['features']
-    
     st.subheader("Clinical Analysis Results")
-    col1, col2 = st.columns([2, 1])
-    
+    col1, col2 = st.columns([2,1])
     with col1:
-        st.write("**Patient Features Used for Prediction:**")
-        feature_display = features.T
-        feature_display.columns = ['Value']
-        st.dataframe(feature_display)
-    
+        st.write("Features used:")
+        df_disp = pd.DataFrame.from_dict(patient['features'], orient='index', columns=['value'])
+        st.dataframe(df_disp)
     with col2:
-        st.metric("Clinical Severity Score", patient['severity_score'], 
-                 delta="Critical" if patient['severity_score'] >= 15 else 
-                       "High Risk" if patient['severity_score'] >= 10 else 
-                       "Moderate Risk" if patient['severity_score'] >= 5 else "Low Risk",
-                 delta_color="inverse")
-        
-        # Show severity score interpretation
-        score = patient['severity_score']
-        if score >= 15:
-            st.error("Critical Condition - Requires immediate intervention")
-        elif score >= 10:
-            st.warning("High Risk - Close monitoring needed")
-        elif score >= 5:
-            st.info("Moderate Risk - Regular monitoring recommended")
-        else:
-            st.success("Low Risk - Outpatient management appropriate")
+        st.metric("Severity Score", patient['severity_score'], delta="High" if patient['severity_score']>=10 else "Moderate" if patient['severity_score']>=5 else "Low")
 
-    # Add diagnosis prediction section
-    if models['diagnosis'] is None:
-        st.error("Diagnosis prediction model not loaded. Please train models in sidebar.")
-    else:
-        with st.spinner("Analyzing symptoms to determine diagnosis..."):
-            time.sleep(0.5)
-            
-            try:
-                # Get predicted diagnosis
-                diagnosis_code = models['diagnosis'].predict(features)[0]
-                
-                # Ensure diagnosis_code is a string
-                if isinstance(diagnosis_code, np.ndarray):
-                    diagnosis_code = str(diagnosis_code[0])
-                else:
-                    diagnosis_code = str(diagnosis_code)
-                    
-                # Get diagnosis data
-                diagnosis_data = DIAGNOSIS_MAPPING.get(diagnosis_code, {})
-                
-                # Store in session state
-                st.session_state.current_patient['diagnosis_code'] = diagnosis_code
-                st.session_state.current_patient['diagnosis_data'] = diagnosis_data
-                
-                st.subheader("AI Diagnosis")
-                if diagnosis_data:
-                    st.success(f"**{diagnosis_data['name']}**")
-                    st.caption(diagnosis_data['description'])
-                    
-                    # Show confidence for diagnosis
-                    try:
-                        proba = models['diagnosis'].predict_proba(features)[0]
-                        max_prob = max(proba) * 100
-                        st.caption(f"Diagnosis confidence: {max_prob:.1f}%")
-                    except:
-                        pass
-                else:
-                    st.warning("Could not determine diagnosis. Please consult with specialist.")
-                    diagnosis_data = {'name': 'Unknown', 'medicines': []}
-                    
-            except Exception as e:
-                st.error(f"Error predicting diagnosis: {str(e)}")
-                diagnosis_code = 'D06'  # Default to gastroenteritis
-                diagnosis_data = DIAGNOSIS_MAPPING.get(diagnosis_code, {})
-                st.session_state.current_patient['diagnosis_code'] = diagnosis_code
-                st.session_state.current_patient['diagnosis_data'] = diagnosis_data
+    # Prepare feature DataFrame for models
+    feat = patient['features']
+    X = pd.DataFrame([{
+        'age': feat['age'],'bmi': feat['bmi'],'blood_pressure_sys': feat['blood_pressure_sys'],
+        'blood_pressure_dia': feat['blood_pressure_dia'],'heart_rate': feat['heart_rate'],'temperature': feat['temperature'],
+        'symptom_cough': feat['symptom_cough'],'symptom_fever': feat['symptom_fever'],'symptom_breathless': feat['symptom_breathless'],
+        'comorbidity_diabetes': feat['comorbidity_diabetes'],'comorbidity_hypertension': feat['comorbidity_hypertension'],
+        'lab_wbc': feat['lab_wbc'],'lab_crp': feat['lab_crp'],'severity_score': feat['severity_score'],
+        'is_respiratory': feat.get('is_respiratory',0),'is_infection': feat.get('is_infection',0),
+        'is_cardiac': feat.get('is_cardiac',0),'is_metabolic': feat.get('is_metabolic',0),
+        'is_neuro': feat.get('is_neuro',0),'is_gi': feat.get('is_gi',0),'age_over_65': feat.get('age_over_65',0)
+    }])
 
-    # Prediction section
+    # DIAGNOSIS PREDICTION
     st.markdown("---")
-    st.subheader("AI Prediction Results")
-    
-    if models['inpatient'] is None:
-        st.error("Inpatient prediction model not loaded. Please train models in sidebar.")
-    else:
-        with st.spinner("Calculating admission recommendation..."):
-            time.sleep(0.5)
-            
-            # Try predicting normally, but if the model complains about missing columns
-            # (e.g. 'diagnosis_code'), augment features with that column and retry.
-            try:
-                pred_in = models['inpatient'].predict(features)[0]
-                pred_in = int(pred_in[0]) if isinstance(pred_in, np.ndarray) else int(pred_in)
-            except Exception as e:
-                err = str(e)
-                # Quick check for missing diagnosis_code in the exception text
-                if 'diagnosis_code' in err:
-                    features_with_diag = features.copy()
-                    diag_code = st.session_state.current_patient.get('diagnosis_code', 'D06')
-                    features_with_diag['diagnosis_code'] = diag_code
-                    try:
-                        pred_in = models['inpatient'].predict(features_with_diag)[0]
-                        pred_in = int(pred_in[0]) if isinstance(pred_in, np.ndarray) else int(pred_in)
-                    except Exception as e2:
-                        st.error(f"Error predicting admission after adding diagnosis_code: {str(e2)}")
-                        pred_in = 0
-                else:
-                    st.error(f"Error predicting admission: {err}")
-                    pred_in = 0
-
-            # Get confidence with fallback
-            prob = None
-            try:
-                if hasattr(models['inpatient'], 'predict_proba'):
-                    # Use the same features that worked for prediction
-                    # If prediction worked with features_with_diag, use that for proba too
-                    proba_features = features.copy()
-                    
-                    # Check if the model expects diagnosis_code column
-                    try:
-                        # Test if current features work
-                        test_proba = models['inpatient'].predict_proba(proba_features)
-                        proba = test_proba
-                    except Exception as e:
-                        if 'diagnosis_code' in str(e):
-                            # Add diagnosis_code and try again
-                            diag_code = st.session_state.current_patient.get('diagnosis_code', 'D06')
-                            proba_features['diagnosis_code'] = diag_code
-                            proba = models['inpatient'].predict_proba(proba_features)
-                        else:
-                            raise
-                    
-                    if proba.shape[1] >= 2:
-                        prob = float(proba[0, 1]) * 100
-                    else:
-                        prob = float(proba[0, 0]) * 100
-            except Exception as proba_error:
-                # Optional: uncomment this line to see the actual error
-                st.warning(f"Confidence calculation failed: {str(proba_error)}")
-                prob = None
-
-            col1, col2 = st.columns(2)
-            
-            # Only recommend inpatient if confidence > 75% for high severity
-            if pred_in == 1 and (prob is None or prob >= 75) and patient['severity_score'] >= 5:
-                with col1:
-                    st.success(f"**HOSPITALIZATION RECOMMENDED** (Confidence: {prob:.1f}%)" if prob is not None else 
-                               "**HOSPITALIZATION RECOMMENDED** (Confidence: N/A)")
-                
-                # Show ward and stay prediction
-                if models['ward'] is not None and models['stay'] is not None:
-                    try:
-                        # try predict ward; if missing columns (diagnosis_code) retry with augmented features
-                        try:
-                            ward_pred = models['ward'].predict(features)[0]
-                        except Exception as werr:
-                            if 'diagnosis_code' in str(werr):
-                                features_with_diag = features.copy()
-                                diag_code = st.session_state.current_patient.get('diagnosis_code', 'D06')
-                                features_with_diag['diagnosis_code'] = diag_code
-                                ward_pred = models['ward'].predict(features_with_diag)[0]
-                            else:
-                                raise
-
-                        ward = str(ward_pred[0]) if isinstance(ward_pred, np.ndarray) else str(ward_pred)
-
-                        # try predict stay_days; same retry-on-missing-column logic
-                        try:
-                            stay_pred = models['stay'].predict(features)[0]
-                        except Exception as serr:
-                            if 'diagnosis_code' in str(serr):
-                                features_with_diag = features.copy()
-                                features_with_diag['diagnosis_code'] = st.session_state.current_patient.get('diagnosis_code', 'D06')
-                                stay_pred = models['stay'].predict(features_with_diag)[0]
-                            else:
-                                raise
-
-                        stay_days = max(1, int(round(stay_pred)))
-
-                        ward_details = {
-                            'General': 'Standard ward for stable patients',
-                            'ICU': 'Intensive care for critical cases',
-                            'Isolation': 'Specialized infection control unit',
-                            'Cardiac': 'Heart condition monitoring unit'
-                        }
-                        
-                        with col2:
-                            st.warning(f"Recommended Ward: {ward}")
-                            st.info(f"Estimated Stay: {stay_days} days")
-                            st.caption(f"*{ward_details.get(ward, 'Specialized care unit')}*")
-                    except Exception as e:
-                        st.warning(f"Error predicting ward/stay: {str(e)}")
-                        st.info("Estimated Stay: 3 days (default)")
-                        st.warning("Recommended Ward: General (default)")
-            else:
-                with col1:
-                    st.info(f"Outpatient Care Recommended (Confidence: {100-prob:.1f}%)" if prob is not None else 
-                           "Outpatient Care Recommended (Confidence: N/A)")
-                
-                # Show outpatient recommendation
-                with col2:
-                    st.info("Treatment can be managed through outpatient care")
-                    st.caption("Regular follow-up recommended")
-
-    # Admission workflow for inpatients
-    if models['inpatient'] is not None and patient['severity_score'] >= 5:
-        # Check if we should recommend admission based on both model and clinical judgment
-        should_admit = False
-        
-        try:
-            # Get prediction from model
-            pred_in = models['inpatient'].predict(features)[0]
-            pred_in = int(pred_in[0]) if isinstance(pred_in, np.ndarray) else int(pred_in)
-            
-            # Use clinical judgment + model prediction
-            if pred_in == 1 and patient['severity_score'] >= 5:
-                should_admit = True
-        except:
-            # Fallback: use severity score only
-            if patient['severity_score'] >= 10:  # Critical or high risk
-                should_admit = True
-        
-        if should_admit:
-            st.markdown("---")
-            st.subheader("Medication Assignment")
-            
-            stock = load_stock()
-            if stock.empty:
-                st.error("No medicines available in inventory. Please replenish stock.")
-            else:
-                # Get diagnosis data (ensure it exists)
-                diagnosis_data = st.session_state.current_patient.get('diagnosis_data', {})
-                if not diagnosis_data:
-                    diagnosis_data = {'name': 'Unknown', 'medicines': []}
-                
-                # Get recommended medicines for this diagnosis
-                recommended_meds = diagnosis_data.get('medicines', [])
-                
-                # Filter available medicines that are in stock
-                available_meds = stock[
-                    stock['medicine_name'].isin(recommended_meds) & 
-                    (stock['stock'] > 0)
-                ]
-                
-                if recommended_meds:
-                    st.info(f"**Recommended Medicines for {diagnosis_data['name']}:**")
-                    med_list = "\n".join([f"- {med}" for med in recommended_meds])
-                    st.markdown(f"```{med_list}```")
-                else:
-                    st.warning("No specific medication recommendations for this diagnosis.")
-                
-                if available_meds.empty:
-                    st.warning("No recommended medicines are in stock. Please replenish immediately.")
-                else:
-                    med_col1, med_col2 = st.columns(2)
-                    
-                    with med_col1:
-                        # Auto-select the first available recommended medicine
-                        selected_med = st.selectbox(
-                            'Select Medication', 
-                            available_meds['medicine_name'].tolist(),
-                            index=0,
-                            help="Choose from available in-stock medications"
-                        )
-                    
-                    with med_col2:
-                        # Get the selected row by position to obtain a scalar value safely
-                        selected_row = available_meds[available_meds['medicine_name'] == selected_med].iloc[0]
-                        stock_val = selected_row['stock']
-                        # Convert numpy/pandas scalar to native Python int using .item() when available
-                        current_stock = int(stock_val.item() if hasattr(stock_val, 'item') else stock_val)
-                        qty = st.number_input(
-                            'Quantity Needed', 
-                            min_value=1, 
-                            max_value=current_stock, 
-                            value=1,
-                            help=f"Available stock: {current_stock}"
-                        )
-                    
-                    admit_clicked = st.button('CONFIRM ADMISSION & MEDICATION', 
-                                            type='primary',
-                                            use_container_width=True)
-                    
-                    if admit_clicked:
-                        # Process admission
-                        ward = 'General'  # Default
-                        stay_days = 3  # Default
-                        
-                        try:
-                            if models['ward']:
-                                try:
-                                    ward_pred = models['ward'].predict(features)[0]
-                                except Exception as werr:
-                                    if 'diagnosis_code' in str(werr):
-                                        features_with_diag = features.copy()
-                                        features_with_diag['diagnosis_code'] = st.session_state.current_patient.get('diagnosis_code', 'D06')
-                                        ward_pred = models['ward'].predict(features_with_diag)[0]
-                                    else:
-                                        raise
-                                ward = str(ward_pred[0]) if isinstance(ward_pred, np.ndarray) else str(ward_pred)
-                                
-                            if models['stay']:
-                                try:
-                                    stay_pred = models['stay'].predict(features)[0]
-                                except Exception as serr:
-                                    if 'diagnosis_code' in str(serr):
-                                        features_with_diag = features.copy()
-                                        features_with_diag['diagnosis_code'] = st.session_state.current_patient.get('diagnosis_code', 'D06')
-                                        stay_pred = models['stay'].predict(features_with_diag)[0]
-                                    else:
-                                        raise
-                                stay_days = max(1, int(round(stay_pred)))
-                        except Exception as e:
-                            st.warning(f"Using default values for ward/stay: {str(e)}")
-                        
-                        # Create admission data
-                        admission_data = {
-                            'patient_id': patient['pid'],
-                            'ward_type': ward,
-                            'estimated_days': stay_days,
-                            'med_used': selected_med,
-                            'qty': int(qty),
-                            'diagnosis_code': st.session_state.current_patient.get('diagnosis_code', 'D06'),
-                            'severity_score': int(patient['severity_score']),
-                            'prediction_confidence': float(prob) if prob is not None else None
-                        }
-
-                        # Database operations
-                        if db:
-                            success, message, row = insert_admission_supabase(db, admission_data)
-                            if not success:
-                                st.error(f"Database error: {message}")
-                                st.stop()
-
-                            admission_id = row.get('id') if row else None
-                            st.session_state.last_admission_id = admission_id
-
-                            stock_success, stock_msg, _ = decrement_medicine_stock_supabase(
-                                db, str(selected_med), int(qty)
-                            )
-                            if not stock_success:
-                                st.error(f"Stock update failed: {stock_msg}. Admission rolled back.")
-                                st.stop()
-
-                            st.success(f"Admission recorded successfully (ID: {admission_id})" if admission_id else 
-                                      "Admission recorded successfully (ID: N/A)")
-
-                        # Local fallback
-                        else:
-                            st.info("Using local storage (Supabase unavailable)")
-                            try:
-                                log_df = pd.DataFrame([{
-                                    **admission_data,
-                                    'admit_time': patient['timestamp'].isoformat(),
-                                    'status': 'Admitted'
-                                }])
-                                
-                                if os.path.exists(PATIENTS_LOG):
-                                    log_df.to_csv(PATIENTS_LOG, mode='a', header=False, index=False)
-                                else:
-                                    log_df.to_csv(PATIENTS_LOG, index=False)
-                                
-                                st.success("Admission logged locally")
-                            except Exception as e:
-                                st.error(f"Local save failed: {str(e)}")
-                        
-                        # Update local stock
-                        try:
-                            # Find the index in the original stock dataframe for the selected medicine
-                            mask = stock['medicine_name'] == selected_med
-                            if mask.any():
-                                idx = stock.index[mask][0]
-                                stock.at[idx, 'stock'] = max(0, current_stock - int(qty))
-                                save_stock(stock)
-                            else:
-                                st.warning("Selected medicine not found in local stock; skipping local stock update.")
-                        except Exception as e:
-                            st.error(f"Stock update error: {str(e)}")
-                            # Best-effort fallback attempt
-                            try:
-                                mask = stock['medicine_name'] == selected_med
-                                if mask.any():
-                                    idx = stock.index[mask][0]
-                                    stock.at[idx, 'stock'] = max(0, current_stock - int(qty))
-                                    save_stock(stock)
-                            except Exception:
-                                st.error("Failed to update local stock.")
-
-                        st.balloons()
-                        st.session_state.admission_complete = True
-                        safe_rerun()
-
-# Stock management section
-st.markdown("---")
-st.subheader("Medicine Inventory Management")
-
-stock_df = load_stock()
-if not stock_df.empty:
-    stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0).astype(int)
-
-    # Display the stock dataframe
-    st.dataframe(stock_df)
-
-    # Highlight low stock items
-    out_of_stock = stock_df[stock_df['stock'] == 0]
-    low_stock = stock_df[(stock_df['stock'] > 0) & (stock_df['stock'] < 5)]
-    if not out_of_stock.empty:
-        st.warning(f"{len(out_of_stock)} medicine(s) are out of stock: {', '.join(out_of_stock['medicine_name'].tolist())}")
-    if not low_stock.empty:
-        st.info(f"ℹ{len(low_stock)} medicine(s) have low stock (<5): {', '.join(low_stock['medicine_name'].tolist())}")
-else:
-    st.info("No stock data available. Please generate initial stock.")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    if st.button('Refresh Stock Data'):
-        st.cache_resource.clear()
-        safe_rerun()
-
-with col2:
-    if st.button('Replenish Critical Stock', type='primary'):
-        low_stock = stock_df[stock_df['stock'] < 5]
-        if not low_stock.empty:
-            for _, row in low_stock.iterrows():
-                new_stock = int(row['stock']) + 10
-                stock_df.loc[stock_df['medicine_name'] == row['medicine_name'], 'stock'] = new_stock
-
-                if db:
-                    replenish_medicine_stock_supabase(db, str(row['medicine_name']), int(new_stock))
-
-            save_stock(stock_df)
-            st.success(f"Replenished {len(low_stock)} low-stock items (+10 each)")
-            safe_rerun()
+    st.subheader("AI Diagnosis")
+    try:
+        diag_pred = models['diagnosis'].predict(X)[0]
+        # sanitize diag_pred
+        if isinstance(diag_pred, (list, np.ndarray)):
+            diag_code = str(diag_pred[0])
         else:
-            st.info("All items have sufficient stock")
+            diag_code = str(diag_pred)
+        # ensure format Dxx
+        if diag_code.isdigit():
+            diag_code = f"D{int(diag_code):02d}"
+        if diag_code not in DIAGNOSIS_MAPPING:
+            # fallback selection by severity bucket
+            if patient['severity_score'] >= 12:
+                diag_code = np.random.choice(['D01','D02','D03','D04','D05'])
+            elif patient['severity_score'] >= 6:
+                diag_code = np.random.choice(['D06','D07','D08','D09','D10'])
+            else:
+                diag_code = np.random.choice(['D11','D12','D13','D14','D15','D16'])
+        diagnosis_data = DIAGNOSIS_MAPPING.get(diag_code, {'name':'Unknown','description':'','medicines':[]})
+        st.success(f"{diag_code} - {diagnosis_data['name']}")
+        st.caption(diagnosis_data['description'])
+        # confidence if available
+        try:
+            proba = models['diagnosis'].predict_proba(X)[0]
+            # proba for multiclass: we can attempt to find index for predicted label
+            # but sklearn pipeline returns class labels in clf.classes_
+            if hasattr(models['diagnosis'].named_steps['clf'], 'classes_'):
+                classes = models['diagnosis'].named_steps['clf'].classes_
+                idx = np.where(classes == diag_code)[0]
+                if len(idx) > 0:
+                    conf = float(proba[idx[0]])*100
+                    st.caption(f"Diagnosis confidence: {conf:.1f}%")
+        except Exception:
+            pass
+        # persist
+        st.session_state.current_patient['diagnosis_code'] = diag_code
+        st.session_state.current_patient['diagnosis_data'] = diagnosis_data
+    except Exception as e:
+        st.error(f"Diagnosis prediction failed: {e}")
+        # fallback mapping
+        diag_code = 'D16'
+        st.session_state.current_patient['diagnosis_code'] = diag_code
+        st.session_state.current_patient['diagnosis_data'] = DIAGNOSIS_MAPPING.get(diag_code,{ 'name':'Unknown','medicines':[] })
 
-with col3:
-    if st.button('Full Stock Replenishment (Demo)', type='secondary'):
-        stock_df['stock'] = stock_df['stock'] + 10
+    # INPATIENT / OUTPATIENT DECISION
+    st.markdown("---")
+    st.subheader("Admission Recommendation")
+    inpatient_recommendation = False
+    inpatient_confidence = None
+    try:
+        # Add diagnosis_code into features if model expects it
+        X_in = X.copy()
+        X_in['diagnosis_code'] = st.session_state.current_patient.get('diagnosis_code', 'D16')
+        if models['inpatient'] is not None:
+            pred_in = models['inpatient'].predict(X_in)[0]
+            pred_int = int(pred_in[0]) if isinstance(pred_in, (list,tuple,np.ndarray)) else int(pred_in)
+            inpatient_recommendation = (pred_int == 1)
+            # try to get probability
+            try:
+                proba = models['inpatient'].predict_proba(X_in)
+                # if binary, proba shape (n,2)
+                if proba.shape[1] == 2:
+                    inpatient_confidence = float(proba[0,1]*100)
+                else:
+                    inpatient_confidence = float(proba[0,0]*100)
+            except Exception:
+                inpatient_confidence = None
+        else:
+            # fallback by severity
+            inpatient_recommendation = patient['severity_score'] >= 10
+    except Exception as e:
+        st.warning(f"Inpatient prediction error: {e}")
+        inpatient_recommendation = patient['severity_score'] >= 10
 
-        if db:
-            for _, row in stock_df.iterrows():
-                replenish_medicine_stock_supabase(db, str(row['medicine_name']), int(row['stock']))
-
-        save_stock(stock_df)
-        st.success("All medicines replenished (+10 units each)")
-        safe_rerun()
-
-# Admission history section
-st.markdown("---")
-st.subheader("Recent Admissions")
-
-if st.session_state.last_admission_id:
-    st.info(f"Last admission ID: {st.session_state.last_admission_id}")
-    
-    if os.path.exists(PATIENTS_LOG):
-        log_df = pd.read_csv(PATIENTS_LOG)
-        st.dataframe(log_df.tail(5))
+    if inpatient_recommendation:
+        if inpatient_confidence:
+            st.success(f"HOSPITALIZATION RECOMMENDED (Confidence: {inpatient_confidence:.1f}%)")
+        else:
+            st.success("HOSPITALIZATION RECOMMENDED")
+        # Ward & stay predictions
+        ward = 'General'
+        stay_days = 3
+        try:
+            X_ward = X.copy()
+            X_ward['diagnosis_code'] = st.session_state.current_patient['diagnosis_code']
+            if models['ward'] is not None:
+                ward_pred = models['ward'].predict(X_ward)[0]
+                ward = str(ward_pred[0]) if isinstance(ward_pred, (list,tuple,np.ndarray)) else str(ward_pred)
+            if models['stay'] is not None:
+                stay_pred = models['stay'].predict(X_ward)[0]
+                stay_days = max(1, int(round(float(stay_pred))))
+        except Exception as e:
+            st.warning(f"Ward/stay prediction failed: {e}")
+        st.info(f"Recommended Ward: {ward}")
+        st.info(f"Estimated Stay: {stay_days} days")
     else:
-        st.info("No admission history available yet")
+        st.info("Outpatient care recommended")
+        if inpatient_confidence is not None:
+            st.caption(f"Model inpatient confidence: {inpatient_confidence:.1f}%")
+
+    # MEDICINE RECOMMENDATION
+    st.markdown("---")
+    st.subheader("Medication Recommendation")
+    diagnosis_data = st.session_state.current_patient.get('diagnosis_data', {})
+    recommended_from_map = diagnosis_data.get('medicines', [])
+    ml_recommended = []
+    # Use medicine ML recommender if present
+    try:
+        if models['medicine'] is not None:
+            med_pipeline = models['medicine']['pipeline']
+            mlb = models['medicine']['mlb']
+            X_med = X.copy()
+            X_med['diagnosis_code'] = st.session_state.current_patient.get('diagnosis_code','D16')
+            y_pred = med_pipeline.predict(X_med)
+            # y_pred is binary matrix
+            labels = mlb.inverse_transform(y_pred)
+            if len(labels) > 0 and len(labels[0]) > 0:
+                ml_recommended = list(labels[0])
+    except Exception as e:
+        st.warning(f"Medicine recommender failed: {e}")
+        ml_recommended = []
+
+    # Final recommended meds: prefer ML recommender when non-empty, else DIAGNOSIS_MAPPING
+    final_recommend = ml_recommended if len(ml_recommended) > 0 else recommended_from_map
+    if final_recommend:
+        st.info("Recommended medicines (automated):")
+        st.markdown("```\n" + "\n".join([f"- {m}" for m in final_recommend]) + "\n```")
+    else:
+        st.warning("No automated medicine recommendation available. Please consult clinician.")
+
+    # Inventory and admission (if decided to admit)
+    if inpatient_recommendation:
+        st.markdown("---")
+        st.subheader("Medication Assignment & Admission")
+        stock_df = load_stock()
+        # show recommended meds and available ones
+        available = stock_df[stock_df['medicine_name'].isin(final_recommend) & (stock_df['stock'] > 0)]
+        if available.empty:
+            st.warning("No recommended medicines are currently in stock.")
+        else:
+            med_choice = st.selectbox("Select medication to assign", available['medicine_name'].tolist())
+            sel_row = available[available['medicine_name'] == med_choice].iloc[0]
+            current_stock = int(sel_row['stock'])
+            qty = st.number_input("Quantity", min_value=1, max_value=current_stock, value=1)
+            if st.button("Confirm Admission & Assign Medication"):
+                # Process admission record (local storage fallback)
+                admission = {
+                    'patient_id': patient['pid'],
+                    'admit_time': patient['timestamp'].isoformat(),
+                    'ward_type': ward,
+                    'estimated_days': stay_days,
+                    'med_used': med_choice,
+                    'qty': int(qty),
+                    'diagnosis_code': st.session_state.current_patient.get('diagnosis_code','D16'),
+                    'severity_score': patient['severity_score']
+                }
+                # Save admission to CSV
+                os.makedirs(DATA_DIR, exist_ok=True)
+                admission_df = pd.DataFrame([admission])
+                if os.path.exists(PATIENTS_LOG):
+                    admission_df.to_csv(PATIENTS_LOG, mode='a', header=False, index=False)
+                else:
+                    admission_df.to_csv(PATIENTS_LOG, index=False)
+                # decrement stock
+                mask = stock_df['medicine_name'] == med_choice
+                stock_df.loc[mask, 'stock'] = stock_df.loc[mask, 'stock'] - int(qty)
+                save_stock(stock_df)
+                st.success("Admission recorded and stock updated.")
+                st.session_state.last_admission_id = f"LOCAL-{int(time.time())}"
+                st.session_state.admission_complete = True
+                safe_rerun()
+
+# Inventory management and recent admissions
+st.markdown("---")
+st.subheader("Medicine Inventory")
+stock_df = load_stock()
+st.dataframe(stock_df)
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Replenish Low Stock (+10 each)"):
+        low = stock_df[stock_df['stock'] < 5]
+        for idx in low.index:
+            # safely coerce to numeric (handles strings/None) and treat NaN as 0
+            val = pd.to_numeric(stock_df.at[idx, 'stock'], errors='coerce')
+            if np.isnan(val):
+                val = 0
+            stock_df.at[idx, 'stock'] = int(val) + 10
+        save_stock(stock_df)
+        st.success("Low stock items replenished.")
+with col2:
+    if st.button("Full Replenish (+10 each)"):
+        # ensure numeric dtype and use Series.add to satisfy type-checkers
+        stock_df['stock'] = stock_df['stock'].astype(int).add(10)
+        save_stock(stock_df)
+        st.success("All items replenished.")
 
 st.markdown("---")
-st.caption("Hospital Management System v1.5 • Predictions based on clinical decision support algorithms")
+st.subheader("Recent Admissions (local log)")
+if os.path.exists(PATIENTS_LOG):
+    try:
+        log_df = pd.read_csv(PATIENTS_LOG)
+        st.dataframe(log_df.tail(10))
+    except Exception as e:
+        st.error(f"Failed to read admission log: {e}")
+else:
+    st.info("No local admission log found.")
+
+st.markdown("---")
+st.caption("Hospital Management System Created by K-7 @2025")
