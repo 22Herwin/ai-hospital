@@ -390,27 +390,92 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
 
             # Get confidence with fallback
             prob = None
-            # Compute inpatient-class probability robustly
-            prob = get_inpatient_probability(models['inpatient'], features)
+            try:
+                if hasattr(models['inpatient'], 'predict_proba'):
+                    # Use the same features that worked for prediction
+                    # If prediction worked with features_with_diag, use that for proba too
+                    proba_features = features.copy()
+                    
+                    # Check if the model expects diagnosis_code column
+                    try:
+                        # Test if current features work
+                        test_proba = models['inpatient'].predict_proba(proba_features)
+                        proba = test_proba
+                    except Exception as e:
+                        if 'diagnosis_code' in str(e):
+                            # Add diagnosis_code and try again
+                            diag_code = st.session_state.current_patient.get('diagnosis_code', 'D06')
+                            proba_features['diagnosis_code'] = diag_code
+                            proba = models['inpatient'].predict_proba(proba_features)
+                        else:
+                            raise
+                    
+                    if proba.shape[1] >= 2:
+                        prob = float(proba[0, 1]) * 100
+                    else:
+                        prob = float(proba[0, 0]) * 100
+            except Exception as proba_error:
+                # Optional: uncomment this line to see the actual error
+                st.warning(f"Confidence calculation failed: {str(proba_error)}")
+                prob = None
 
             col1, col2 = st.columns(2)
             
             # Only recommend inpatient if confidence > 75% for high severity
             if pred_in == 1 and (prob is None or prob >= 75) and patient['severity_score'] >= 5:
-                 with col1:
+                with col1:
                     st.success(f"**HOSPITALIZATION RECOMMENDED** (Confidence: {prob:.1f}%)" if prob is not None else 
                                "**HOSPITALIZATION RECOMMENDED** (Confidence: N/A)")
                 
+                # Show ward and stay prediction
+                if models['ward'] is not None and models['stay'] is not None:
+                    try:
+                        # try predict ward; if missing columns (diagnosis_code) retry with augmented features
+                        try:
+                            ward_pred = models['ward'].predict(features)[0]
+                        except Exception as werr:
+                            if 'diagnosis_code' in str(werr):
+                                features_with_diag = features.copy()
+                                diag_code = st.session_state.current_patient.get('diagnosis_code', 'D06')
+                                features_with_diag['diagnosis_code'] = diag_code
+                                ward_pred = models['ward'].predict(features_with_diag)[0]
+                            else:
+                                raise
 
-# ...existing code...
+                        ward = str(ward_pred[0]) if isinstance(ward_pred, np.ndarray) else str(ward_pred)
 
+                        # try predict stay_days; same retry-on-missing-column logic
+                        try:
+                            stay_pred = models['stay'].predict(features)[0]
+                        except Exception as serr:
+                            if 'diagnosis_code' in str(serr):
+                                features_with_diag = features.copy()
+                                features_with_diag['diagnosis_code'] = st.session_state.current_patient.get('diagnosis_code', 'D06')
+                                stay_pred = models['stay'].predict(features_with_diag)[0]
+                            else:
+                                raise
+
+                        stay_days = max(1, int(round(stay_pred)))
+
+                        ward_details = {
+                            'General': 'Standard ward for stable patients',
+                            'ICU': 'Intensive care for critical cases',
+                            'Isolation': 'Specialized infection control unit',
+                            'Cardiac': 'Heart condition monitoring unit'
+                        }
+                        
+                        with col2:
+                            st.warning(f"Recommended Ward: {ward}")
+                            st.info(f"Estimated Stay: {stay_days} days")
+                            st.caption(f"*{ward_details.get(ward, 'Specialized care unit')}*")
+                    except Exception as e:
+                        st.warning(f"Error predicting ward/stay: {str(e)}")
+                        st.info("Estimated Stay: 3 days (default)")
+                        st.warning("Recommended Ward: General (default)")
             else:
                 with col1:
-                    if prob is not None:
-                        outpatient_conf = max(0.0, min(100.0, 100.0 - float(prob)))
-                        st.info(f"Outpatient Care Recommended (Confidence: {outpatient_conf:.1f}%)")
-                    else:
-                        st.info("Outpatient Care Recommended (Confidence: N/A)")
+                    st.info(f"Outpatient Care Recommended (Confidence: {100-prob:.1f}%)" if prob is not None else 
+                           "Outpatient Care Recommended (Confidence: N/A)")
                 
                 # Show outpatient recommendation
                 with col2:
@@ -465,7 +530,7 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                     st.warning("No specific medication recommendations for this diagnosis.")
                 
                 if available_meds.empty:
-                    st.warning("⚠️ No recommended medicines are in stock. Please replenish immediately.")
+                    st.warning("No recommended medicines are in stock. Please replenish immediately.")
                 else:
                     med_col1, med_col2 = st.columns(2)
                     
@@ -620,9 +685,9 @@ if not stock_df.empty:
     out_of_stock = stock_df[stock_df['stock'] == 0]
     low_stock = stock_df[(stock_df['stock'] > 0) & (stock_df['stock'] < 5)]
     if not out_of_stock.empty:
-        st.warning(f"⚠️ {len(out_of_stock)} medicine(s) are out of stock: {', '.join(out_of_stock['medicine_name'].tolist())}")
+        st.warning(f"{len(out_of_stock)} medicine(s) are out of stock: {', '.join(out_of_stock['medicine_name'].tolist())}")
     if not low_stock.empty:
-        st.info(f"ℹ️ {len(low_stock)} medicine(s) have low stock (<5): {', '.join(low_stock['medicine_name'].tolist())}")
+        st.info(f"ℹ{len(low_stock)} medicine(s) have low stock (<5): {', '.join(low_stock['medicine_name'].tolist())}")
 else:
     st.info("No stock data available. Please generate initial stock.")
 
@@ -645,7 +710,7 @@ with col2:
                     replenish_medicine_stock_supabase(db, str(row['medicine_name']), int(new_stock))
 
             save_stock(stock_df)
-            st.success(f"✅ Replenished {len(low_stock)} low-stock items (+10 each)")
+            st.success(f"Replenished {len(low_stock)} low-stock items (+10 each)")
             safe_rerun()
         else:
             st.info("All items have sufficient stock")
@@ -659,7 +724,7 @@ with col3:
                 replenish_medicine_stock_supabase(db, str(row['medicine_name']), int(row['stock']))
 
         save_stock(stock_df)
-        st.success("✅ All medicines replenished (+10 units each)")
+        st.success("All medicines replenished (+10 units each)")
         safe_rerun()
 
 # Admission history section
