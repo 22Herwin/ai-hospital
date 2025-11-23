@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-train_models.py
-Train the full set of models:
- - diagnosis_model.pkl    (multi-class)
- - inpatient_model.pkl    (binary classification)
- - ward_model.pkl         (multi-class for ward assignment)
- - stay_model.pkl         (regression for stay days)
- - medicine_model.pkl     (multi-label recommender)
-
-Usage:
-    python train_models.py --data data/patients_sample.csv --out_dir models
-"""
 import os
 import argparse
 import pandas as pd

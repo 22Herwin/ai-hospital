@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-generate_dataset.py
-Generates a balanced, targeted medical dataset with explicit diagnosis codes and
-realistic clinical patterns for training the Mode C ML pipeline.
-
-Usage:
-    python generate_dataset.py --n 2000 --out data/patients_sample.csv --seed 42
-"""
 import numpy as np
 import pandas as pd
 import argparse
