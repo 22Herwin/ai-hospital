@@ -194,6 +194,16 @@ Include change summary and testing steps.
 
 ---
 
+## Developed By — Team 7
+
+This project was created and developed by:
+
+- Herwin Dermawan
+- M. Dimas Fajar R.
+- Chriscinntya Seva Garcia
+
+---
+
 ## License
 
-Created By Team - 7 @2025
+MIT License © 2025 Team 7
