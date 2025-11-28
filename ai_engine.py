@@ -12,43 +12,69 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "meditron:7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-SYSTEM_PROMPT = """
-You are a clinical reasoning assistant specialized in medical diagnosis and treatment recommendations. 
-You MUST use ICD-10 codes for all diagnoses.
-
-Input: patient clinical data including symptoms, vitals, lab results, and comorbidities.
-Output: JSON ONLY (strict), with the following keys:
-
-{
-  "icd10_code": "<primary ICD-10 code based on diagnosis>",
-  "diagnosis_name": "<official diagnosis name matching ICD-10>",
-  "confidence": "<0-1 float>",
-  "inpatient": true|false,
-  "estimated_stay_days": <integer or null>,
-  "ward_type": "<ICU|Cardiac|Neurological|General|Isolation|Outpatient>",
-  "recommended_medicines": ["list of standard medications with dosages"],
-  "extracted": {
-     "age": <int|null>,
-     "sex": "M|F|Other|null",
-     "blood_pressure_sys": <int|null>,
-     "blood_pressure_dia": <int|null>,
-     "heart_rate": <int|null>,
-     "temperature_c": <float|null>,
-     "wbc": <float|null>,
-     "crp": <float|null>,
-     "symptoms": ["list of identified symptoms"],
-     "comorbidities": ["list of identified comorbidities"]
-  },
-  "rationale": "<clinical reasoning explaining diagnosis and recommendations>"
+# Define specific disease categories
+HOSPITALIZATION_DISEASES = {
+    "J18.9": {"name": "Pneumonia, unspecified", "ward": "General", "stay_days": 5, "meds": ["Amoxicillin 500mg TDS", "Azithromycin 250mg OD", "Paracetamol 500mg PRN"]},
+    "I21.9": {"name": "Acute myocardial infarction, unspecified", "ward": "ICU", "stay_days": 7, "meds": ["Aspirin 300mg", "Clopidogrel 75mg", "Atorvastatin 80mg"]},
+    "I63.9": {"name": "Cerebral infarction, unspecified", "ward": "Neurological", "stay_days": 10, "meds": ["Aspirin 100mg", "Atorvastatin 40mg", "Mannitol IV PRN"]},
+    "A41.9": {"name": "Sepsis, unspecified", "ward": "ICU", "stay_days": 14, "meds": ["Meropenem 1g IV", "Vancomycin 1g IV", "IV Fluids"]},
+    "J15.9": {"name": "Bacterial pneumonia, unspecified", "ward": "Isolation", "stay_days": 7, "meds": ["Ceftriaxone 1g IV", "Azithromycin 500mg IV", "Oxygen therapy"]}
 }
 
-CRITICAL INSTRUCTIONS:
-- Use ONLY valid ICD-10 codes from official classification
-- Diagnosis name MUST match the ICD-10 code description
-- For inpatient=true, provide estimated_stay_days and appropriate ward_type
-- Recommended medicines should be standard, evidence-based treatments
-- Extract all available clinical data from the input
-- Output valid JSON only - no additional text
+OUTPATIENT_DISEASES = {
+    "I10": {"name": "Essential (primary) hypertension", "ward": "Outpatient", "stay_days": 0, "meds": ["Amlodipine 5mg OD", "Lisinopril 10mg OD"]},
+    "E11.9": {"name": "Type 2 diabetes mellitus without complications", "ward": "Outpatient", "stay_days": 0, "meds": ["Metformin 500mg BD", "Glucose monitoring"]},
+    "J06.9": {"name": "Acute upper respiratory infection, unspecified", "ward": "Outpatient", "stay_days": 0, "meds": ["Paracetamol 500mg QDS", "Chlorpheniramine 4mg TDS"]},
+    "K29.70": {"name": "Gastritis, unspecified, without bleeding", "ward": "Outpatient", "stay_days": 0, "meds": ["Omeprazole 20mg OD", "Antacids PRN"]},
+    "M54.50": {"name": "Low back pain, unspecified", "ward": "Outpatient", "stay_days": 0, "meds": ["Ibuprofen 400mg TDS", "Muscle relaxants PRN"]}
+}
+
+HEALTHY_CODE = {
+    "Z00.0": {"name": "General medical examination", "ward": "Outpatient", "stay_days": 0, "meds": ["Routine follow-up"]}
+}
+
+SYSTEM_PROMPT = """
+You are a clinical reasoning assistant specialized in medical diagnosis using ICD-10 codes.
+
+CRITICAL GUIDELINES:
+1. You MUST select from these specific ICD-10 codes only:
+
+HOSPITALIZATION REQUIRED (Inpatient):
+- J18.9: Pneumonia, unspecified → Ward: General, Stay: 5 days
+- I21.9: Acute myocardial infarction → Ward: ICU, Stay: 7 days  
+- I63.9: Cerebral infarction → Ward: Neurological, Stay: 10 days
+- A41.9: Sepsis, unspecified → Ward: ICU, Stay: 14 days
+- J15.9: Bacterial pneumonia → Ward: Isolation, Stay: 7 days
+
+OUTPATIENT MANAGEMENT:
+- I10: Essential hypertension → Ward: Outpatient
+- E11.9: Type 2 diabetes → Ward: Outpatient
+- J06.9: Acute upper respiratory infection → Ward: Outpatient
+- K29.70: Gastritis → Ward: Outpatient
+- M54.50: Low back pain → Ward: Outpatient
+
+HEALTHY:
+- Z00.0: General medical examination → Ward: Outpatient
+
+2. Output JSON ONLY with these exact keys:
+{
+  "icd10_code": "EXACT_ICD10_CODE_FROM_ABOVE_LIST",
+  "diagnosis_name": "MATCHING_DIAGNOSIS_NAME",
+  "confidence": 0.0-1.0,
+  "inpatient": true|false,
+  "estimated_stay_days": number_or_null,
+  "ward_type": "ICU|General|Neurological|Isolation|Outpatient",
+  "recommended_medicines": ["list", "of", "medicines"],
+  "rationale": "clinical reasoning"
+}
+
+3. Hospitalization Criteria:
+- Admit if: high fever + abnormal labs, chest pain + ECG changes, neurological deficits, sepsis signs, respiratory distress
+- Outpatient if: stable vitals, mild symptoms, chronic conditions
+
+4. DO NOT invent new codes. Use ONLY the codes provided above.
+
+Input patient data: {clinical_data}
 """
 
 def call_ollama_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model: str = OLLAMA_MODEL, temperature: float = 0.1) -> Optional[Dict[str, Any]]:
@@ -109,7 +135,17 @@ def analyze_text_with_ollama(text: str) -> Dict[str, Any]:
     """
     High-level wrapper that calls the model for clinical analysis.
     """
-    res = call_ollama_chat(text)
+    # Build the final prompt with clinical data
+    clinical_prompt = f"""
+    Analyze this patient case and provide diagnosis using ONLY the specified ICD-10 codes:
+    
+    CLINICAL DATA:
+    {text}
+    
+    Return valid JSON with icd10_code, diagnosis_name, inpatient, estimated_stay_days, ward_type, recommended_medicines, and rationale.
+    """
+    
+    res = call_ollama_chat(clinical_prompt)
     
     if res is None:
         return fallback_analysis(text)
@@ -120,65 +156,52 @@ def fallback_analysis(text: str) -> Dict[str, Any]:
     """
     Rule-based fallback analysis when AI is unavailable
     """
-    # Extract basic info from text using regex patterns
     import re
     
-    # Look for common patterns in clinical text
+    # Extract symptoms from text
+    text_lower = text.lower()
     symptoms = []
-    if re.search(r'\bfever\b|\btemperature\b|\btemp\b|\bpyrexia\b', text, re.IGNORECASE):
-        symptoms.append("fever")
-    if re.search(r'\bcough\b|\bcoughing\b', text, re.IGNORECASE):
-        symptoms.append("cough")
-    if re.search(r'\bbreath\b|\bbreathing\b|\bdyspnea\b|\bshortness of breath\b', text, re.IGNORECASE):
-        symptoms.append("breathlessness")
-    if re.search(r'\bhypertension\b|\bhigh blood pressure\b|\bhtn\b', text, re.IGNORECASE):
-        symptoms.append("hypertension")
-    if re.search(r'\bdiabet\b|\bsugar\b|\bglucose\b', text, re.IGNORECASE):
-        symptoms.append("diabetes")
     
-    # Simple diagnosis logic based on symptoms
-    if "cough" in symptoms and "fever" in symptoms:
-        diagnosis = {"code": "J18.9", "name": "Pneumonia, unspecified", "meds": ["Amoxicillin 500mg TDS", "Paracetamol 500mg PRN"]}
-        inpatient = True
-        stay_days = 5
-        ward = "General"
-    elif "hypertension" in symptoms:
-        diagnosis = {"code": "I10", "name": "Essential (primary) hypertension", "meds": ["Amlodipine 5mg OD", "Lisinopril 10mg OD"]}
-        inpatient = False
-        stay_days = None
-        ward = "Outpatient"
-    elif "diabetes" in symptoms:
-        diagnosis = {"code": "E11.9", "name": "Type 2 diabetes mellitus without complications", "meds": ["Metformin 500mg BD", "Glucose monitoring"]}
-        inpatient = False
-        stay_days = None
-        ward = "Outpatient"
+    # Check for specific patterns
+    has_fever = re.search(r'\bfever\b|\btemperature\b|\btemp\b|\bpyrexia\b', text_lower)
+    has_cough = re.search(r'\bcough\b|\bcoughing\b', text_lower)
+    has_breathless = re.search(r'\bbreath\b|\bbreathing\b|\bdyspnea\b|\bshortness of breath\b', text_lower)
+    has_chest_pain = re.search(r'\bchest pain\b|\bchest discomfort\b', text_lower)
+    has_hypertension = re.search(r'\bhypertension\b|\bhigh blood pressure\b|\bhtn\b', text_lower)
+    has_diabetes = re.search(r'\bdiabet\b|\bsugar\b|\bglucose\b', text_lower)
+    has_neuro = re.search(r'\bweakness\b|\bnumbness\b|\bparalysis\b|\bstroke\b', text_lower)
+    has_sepsis = re.search(r'\bsepsis\b|\bseptic\b|\binfection\b', text_lower)
+    
+    # Rule-based diagnosis
+    if has_fever and has_cough and has_breathless:
+        diagnosis = HOSPITALIZATION_DISEASES["J18.9"]  # Pneumonia
+    elif has_chest_pain and has_hypertension:
+        diagnosis = HOSPITALIZATION_DISEASES["I21.9"]  # MI
+    elif has_neuro:
+        diagnosis = HOSPITALIZATION_DISEASES["I63.9"]  # Stroke
+    elif has_sepsis and has_fever:
+        diagnosis = HOSPITALIZATION_DISEASES["A41.9"]  # Sepsis
+    elif has_hypertension:
+        diagnosis = OUTPATIENT_DISEASES["I10"]  # Hypertension
+    elif has_diabetes:
+        diagnosis = OUTPATIENT_DISEASES["E11.9"]  # Diabetes
+    elif has_cough or has_fever:
+        diagnosis = OUTPATIENT_DISEASES["J06.9"]  # URI
     else:
-        diagnosis = {"code": "R50.9", "name": "Fever, unspecified", "meds": ["Paracetamol 500mg QDS"]}
-        inpatient = len(symptoms) > 2
-        stay_days = 3 if inpatient else None
-        ward = "General" if inpatient else "Outpatient"
+        diagnosis = HEALTHY_CODE["Z00.0"]  # Healthy
+    
+    # Determine if inpatient based on diagnosis category
+    is_inpatient = diagnosis["icd10_code"] in HOSPITALIZATION_DISEASES if "icd10_code" in diagnosis else diagnosis in HOSPITALIZATION_DISEASES.values()
     
     return {
-        "icd10_code": diagnosis["code"],
+        "icd10_code": list(diagnosis.keys())[0] if isinstance(diagnosis, dict) and "icd10_code" not in diagnosis else diagnosis.get("icd10_code", "Z00.0"),
         "diagnosis_name": diagnosis["name"],
         "confidence": 0.6,
-        "inpatient": inpatient,
-        "estimated_stay_days": stay_days,
-        "ward_type": ward,
+        "inpatient": is_inpatient,
+        "estimated_stay_days": diagnosis["stay_days"] if is_inpatient else 0,
+        "ward_type": diagnosis["ward"],
         "recommended_medicines": diagnosis["meds"],
-        "extracted": {
-            "age": None,
-            "sex": None,
-            "blood_pressure_sys": None,
-            "blood_pressure_dia": None,
-            "heart_rate": None,
-            "temperature_c": None,
-            "wbc": None,
-            "crp": None,
-            "symptoms": symptoms,
-            "comorbidities": []
-        },
-        "rationale": "Fallback rule-based analysis based on detected symptoms: " + ", ".join(symptoms)
+        "rationale": f"Fallback analysis: {diagnosis['name']} based on symptoms detected"
     }
 
 def normalize_ai_response(response: Dict) -> Dict[str, Any]:
@@ -189,43 +212,40 @@ def normalize_ai_response(response: Dict) -> Dict[str, Any]:
     out = {
         "icd10_code": response.get("icd10_code"),
         "diagnosis_name": response.get("diagnosis_name"),
-        "confidence": response.get("confidence", 0.7),
+        "confidence": min(max(response.get("confidence", 0.7), 0.0), 1.0),  # clamp 0-1
         "inpatient": response.get("inpatient", False),
-        "estimated_stay_days": response.get("estimated_stay_days"),
+        "estimated_stay_days": response.get("estimated_stay_days", 0),
         "ward_type": response.get("ward_type", "General"),
         "recommended_medicines": response.get("recommended_medicines", ["Supportive care"]),
         "rationale": response.get("rationale", "Clinical assessment completed")
     }
     
-    # Handle extracted data
-    extracted = response.get("extracted", {})
-    if not isinstance(extracted, dict):
-        extracted = {}
-    
-    out["extracted"] = {
-        "age": extracted.get("age"),
-        "sex": extracted.get("sex"),
-        "blood_pressure_sys": extracted.get("blood_pressure_sys"),
-        "blood_pressure_dia": extracted.get("blood_pressure_dia"),
-        "heart_rate": extracted.get("heart_rate"),
-        "temperature_c": extracted.get("temperature_c"),
-        "wbc": extracted.get("wbc"),
-        "crp": extracted.get("crp"),
-        "symptoms": extracted.get("symptoms", []),
-        "comorbidities": extracted.get("comorbidities", [])
-    }
+    # Validate ICD-10 code against our defined diseases
+    icd_code = out["icd10_code"]
+    if icd_code in HOSPITALIZATION_DISEASES:
+        # Ensure hospitalization settings match our definitions
+        disease_info = HOSPITALIZATION_DISEASES[icd_code]
+        out["inpatient"] = True
+        out["ward_type"] = disease_info["ward"]
+        out["estimated_stay_days"] = disease_info["stay_days"]
+        if not out["recommended_medicines"] or out["recommended_medicines"] == ["Supportive care"]:
+            out["recommended_medicines"] = disease_info["meds"]
+    elif icd_code in OUTPATIENT_DISEASES:
+        disease_info = OUTPATIENT_DISEASES[icd_code]
+        out["inpatient"] = False
+        out["ward_type"] = "Outpatient"
+        out["estimated_stay_days"] = 0
+        if not out["recommended_medicines"] or out["recommended_medicines"] == ["Supportive care"]:
+            out["recommended_medicines"] = disease_info["meds"]
+    elif icd_code in HEALTHY_CODE:
+        disease_info = HEALTHY_CODE[icd_code]
+        out["inpatient"] = False
+        out["ward_type"] = "Outpatient"
+        out["estimated_stay_days"] = 0
+        out["recommended_medicines"] = disease_info["meds"]
     
     # Ensure lists are actually lists
-    if not isinstance(out["extracted"]["symptoms"], list):
-        out["extracted"]["symptoms"] = []
-    if not isinstance(out["extracted"]["comorbidities"], list):
-        out["extracted"]["comorbidities"] = []
     if not isinstance(out["recommended_medicines"], list):
         out["recommended_medicines"] = ["Supportive care"]
-    
-    # Validate ICD-10 code format
-    if out["icd10_code"] and not re.match(r'^[A-Z][0-9]{2}(\.[0-9]{1,})?$', out["icd10_code"]):
-        # If ICD-10 code is malformed, set to null
-        out["icd10_code"] = None
     
     return out
