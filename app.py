@@ -5,22 +5,16 @@ import os
 import datetime
 import time
 import json
-import requests
+import re  # ensure re is imported near top (you already had it in file; keep this)
 from typing import Any, Dict, List, Optional, Tuple
+import ollama  # Import Ollama library for local inference
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-# Get DeepSeek API configuration
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-
-# Allow fallback when API key is missing; do not stop the app
-USE_DEEPSEEK = bool(DEEPSEEK_API_KEY)
-if not USE_DEEPSEEK:
-    st.sidebar.warning("DEEPSEEK_API_KEY not found — using fallback clinical rules (AI unavailable)")
-else:
-    st.sidebar.success("DeepSeek API key loaded")
+# Ollama configuration - no API keys needed!
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "meditron:7b")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 # Initialize session state
 if 'current_patient' not in st.session_state:
@@ -29,9 +23,9 @@ if 'admission_complete' not in st.session_state:
     st.session_state.admission_complete = False
 if 'last_admission_id' not in st.session_state:
     st.session_state.last_admission_id = None
-# track DeepSeek availability so we don't keep calling after a 402/error
-if 'deepseek_unavailable' not in st.session_state:
-    st.session_state['deepseek_unavailable'] = False
+# track AI availability so we don't keep calling after errors
+if 'ai_unavailable' not in st.session_state:
+    st.session_state['ai_unavailable'] = False
 
 # Safe rerun helper
 def safe_rerun():
@@ -92,17 +86,132 @@ def save_stock(df):
         st.error(f"Error saving stock: {str(e)}")
         return False
 
-# DeepSeek AI integration
-def analyze_with_deepseek(features: dict) -> dict:
+# Ollama Meditron integration
+def _extract_raw_ai_text(response: Any) -> str:
+    # Try a few known shapes returned by ollama / wrappers
+    try:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            # common shapes: {'message': {'content': '...'}}, {'choices':[{'message':{'content':...}}]}
+            if 'message' in response and isinstance(response['message'], dict):
+                c = response['message'].get('content')
+                if isinstance(c, str):
+                    return c
+            if 'choices' in response and isinstance(response['choices'], list) and len(response['choices'])>0:
+                first = response['choices'][0]
+                if isinstance(first, dict):
+                    # nested styles
+                    if 'message' in first and isinstance(first['message'], dict):
+                        c = first['message'].get('content')
+                        if isinstance(c, str):
+                            return c
+                    if 'text' in first and isinstance(first['text'], str):
+                        return first['text']
+                    if 'content' in first and isinstance(first['content'], str):
+                        return first['content']
+            # some clients return {'content': '...'}
+            if 'content' in response and isinstance(response['content'], str):
+                return response['content']
+            # as last resort stringify the dict
+            return json.dumps(response)
+    except Exception:
+        pass
+    try:
+        return str(response)
+    except Exception:
+        return ""
+
+def _normalize_result(parsed: Optional[dict], raw_text: str, features: Optional[dict] = None) -> dict:
     """
-    Analyze patient features using DeepSeek API
-    Returns structured JSON response with diagnosis, recommendations, and rationale
+    Ensure the AI response has all expected keys and sensible defaults.
+    If parsed is missing critical keys (icd10_code/diagnosis_name), caller can provide
+    a `features` dict; this function will not run fallback analysis itself but will
+    set better defaults (e.g., 'Z00.0'/'Healthy') for low-severity cases.
     """
-    # If API key not configured or previously marked unavailable, use fallback immediately
-    if not USE_DEEPSEEK or st.session_state.get('deepseek_unavailable', False):
+    # Defensive: ensure parsed is a dict to avoid type-checker/None issues
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    out = {}
+    # Primary fields - use several possible names, keep 'Unknown' only as last resort
+    out['icd10_code'] = parsed.get('icd10_code') or parsed.get('code') or parsed.get('diagnosis_code') or None
+    out['diagnosis_name'] = parsed.get('diagnosis_name') or parsed.get('diagnosis') or None
+
+    # inpatient
+    if parsed.get('inpatient') is None:
+        out['inpatient'] = False
+    else:
+        out['inpatient'] = bool(parsed.get('inpatient'))
+
+    # estimated_stay_days - robust parsing of different types
+    try:
+        val = parsed.get('estimated_stay_days')
+        if val is None or val == '':
+            out['estimated_stay_days'] = 0
+        else:
+            if isinstance(val, (int, float)):
+                out['estimated_stay_days'] = int(val)
+            elif isinstance(val, str):
+                try:
+                    out['estimated_stay_days'] = int(float(val.strip()))
+                except Exception:
+                    m = re.search(r'\d+', val)
+                    out['estimated_stay_days'] = int(m.group(0)) if m else 0
+            else:
+                out['estimated_stay_days'] = 0
+    except Exception:
+        out['estimated_stay_days'] = 0
+
+    out['ward_type'] = parsed.get('ward_type') or parsed.get('ward') or 'General'
+
+    # recommended_medicines: allow string -> list
+    meds = parsed.get('recommended_medicines') or parsed.get('recommended_medications') or parsed.get('meds') or []
+    if isinstance(meds, str):
+        meds = [m.strip() for m in re.split(r'[,\|;]\s*', meds) if m.strip()]
+    out['recommended_medicines'] = meds if isinstance(meds, (list, tuple)) else []
+
+    # rationale
+    out['rationale'] = parsed.get('rationale') or parsed.get('explanation') or (raw_text[:500] if raw_text else "No rationale provided")
+
+    # raw_output for debugging
+    out['raw_output'] = raw_text
+
+    # If AI returned nothing for icd/diagnosis, try to set a safe "healthy" default
+    # if features indicate low severity / no symptoms. Caller should pass features when available.
+    if (not out['icd10_code'] or not out['diagnosis_name']) and features:
+        no_symptoms = not (features.get('symptom_cough') or features.get('symptom_fever') or features.get('symptom_breathless'))
+        low_lab = (features.get('lab_wbc', 0) <= 11 and features.get('lab_crp', 0) <= 10)
+        low_vitals = (features.get('blood_pressure_sys', 0) <= 140 and features.get('blood_pressure_dia', 0) <= 90 and features.get('temperature', 0) <= 37.5)
+        if no_symptoms and low_lab and low_vitals and features.get('severity_score', 0) < 5:
+            # Mark as healthy check / normal exam
+            out['icd10_code'] = out.get('icd10_code') or "Z00.0"
+            out['diagnosis_name'] = out.get('diagnosis_name') or "Healthy / Routine check"
+            out['inpatient'] = False
+            out['estimated_stay_days'] = 0
+            out['recommended_medicines'] = out['recommended_medicines'] or []
+            out['rationale'] = out['rationale'] or "No clinical features suggesting acute disease."
+    # Final safe types
+    if out['icd10_code'] is None:
+        out['icd10_code'] = "Unknown"
+    if out['diagnosis_name'] is None:
+        out['diagnosis_name'] = "Unknown"
+
+    return out
+
+
+def analyze_with_ollama(features: dict) -> dict:
+    """
+    Analyze patient features using Ollama with Meditron model.
+    Improved robustness: if AI returns empty/malformed content we fall back to rule-based
+    diagnosis and merge results (AI fields take precedence when present).
+    """
+    # If previously marked unavailable, use fallback immediately
+    if st.session_state.get('ai_unavailable', False):
+        # fallback_analysis in this file expects features dict
         return fallback_analysis(features)
 
-    # Create clinical note from features
+    # Build clinical note (same as before)
     clinical_note = f"""
     Patient Clinical Summary:
     Age: {features['age']} years, BMI: {features['bmi']}
@@ -122,74 +231,114 @@ def analyze_with_deepseek(features: dict) -> dict:
     - CRP Level: {features['lab_crp']} mg/L
     Clinical Severity Score: {features['severity_score']}
     """
-    
-    # Prepare AI prompt
+
     prompt = f"""
-    You are an expert clinical decision support system. Analyze this patient case and provide a structured response in JSON format with these EXACT keys:
+    You are an expert clinical decision support system specializing in internal medicine. Analyze this patient case and provide a structured response in JSON format with these EXACT keys:
     - icd10_code: Primary ICD-10 diagnosis code (e.g., "J18.9")
     - diagnosis_name: Full diagnosis name matching ICD-10 code
     - inpatient: Boolean (true/false) for hospitalization recommendation
     - estimated_stay_days: Integer for estimated hospital days if admitted
     - ward_type: String describing ward type (e.g., "General", "ICU", "Cardiac")
     - recommended_medicines: List of 2-3 specific medication recommendations with dosages
-    - rationale: Brief clinical justification for recommendations
-    
+    - rationale: Brief clinical justification for recommendations (max 100 words)
+
     PATIENT DATA:
     {clinical_note}
-    
-    IMPORTANT: Return ONLY valid JSON with no additional text or explanation.
+
+    IMPORTANT: Return ONLY valid JSON with no additional text or explanation. Do not include any text outside the JSON structure.
     """
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
-    }
-    
-    payload = {
-        "model": "deepseek-r1",
-        "messages": [
-            {"role": "system", "content": "You are a clinical decision support AI."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1000
-    }
-    
+
     try:
-        with st.spinner("DeepSeek AI analyzing patient case..."):
-            response = requests.post(
-                f"{DEEPSEEK_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30
+        with st.spinner(f"Analyzing with {OLLAMA_MODEL} (local)..."):
+            client = ollama.Client(host=OLLAMA_HOST)
+            response = client.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a clinical decision support AI that responds ONLY with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                format="json",
+                options={
+                    "temperature": 0.3,
+                    "num_ctx": 4096
+                }
             )
 
-        # Handle insufficient balance explicitly: mark unavailable and fallback
-        if response.status_code == 402:
-            st.sidebar.error("DeepSeek API error: Insufficient balance. Switching to fallback rules.")
-            st.session_state['deepseek_unavailable'] = True
-            return fallback_analysis(features)
+        ai_raw = _extract_raw_ai_text(response)
 
-        if response.status_code != 200:
-            st.error(f"DeepSeek API error ({response.status_code}): {response.text}")
-            # Return a dict via the fallback rule-based analysis to satisfy the declared return type
-            return fallback_analysis(features)
+        # log raw output (same as before)
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            log_path = os.path.join(DATA_DIR, "ollama_raw_responses.log")
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.datetime.now().isoformat()} - RAW:\n{ai_raw}\n\n")
+        except Exception:
+            pass
 
-        # Extract AI response
-        ai_response = response.json()['choices'][0]['message']['content']
-        
-        # Clean and parse JSON response
-        json_start = ai_response.find('{')
-        json_end = ai_response.rfind('}') + 1
-        if json_start == -1 or json_end == -1:
-            raise ValueError("Invalid JSON format in AI response")
-        
-        cleaned_json = ai_response[json_start:json_end]
-        return json.loads(cleaned_json)
-    
+        # Try to parse JSON
+        parsed = None
+        try:
+            parsed = json.loads(ai_raw)
+        except Exception:
+            # extract first {...} block
+            m = re.search(r'(\{[\s\S]*\})', ai_raw)
+            if m:
+                try:
+                    parsed = json.loads(m.group(1))
+                except Exception:
+                    parsed = None
+
+        # If still not parsed, try heuristic line parsing
+        if parsed is None:
+            parsed = {}
+            for line in ai_raw.splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    k = k.strip().lower().replace(' ', '_')
+                    v = v.strip()
+                    if v:
+                        if ',' in v:
+                            parsed[k] = [x.strip() for x in v.split(',') if x.strip()]
+                        else:
+                            parsed[k] = v
+
+        # If parsed is empty or lacks key decision fields, use fallback and merge:
+        missing_core = not parsed or (not parsed.get('icd10_code') and not parsed.get('diagnosis_name') and not parsed.get('diagnosis'))
+        if missing_core:
+            # Use fallback rule-based diagnosis for safety
+            fallback = fallback_analysis(features)
+            # Normalize the parsed (even if empty) with features to get types & defaults
+            normalized_ai = _normalize_result(parsed if isinstance(parsed, dict) else {}, ai_raw, features)
+            # Merge: prefer AI when it provided a value, else use fallback values
+            merged = {}
+            merged['icd10_code'] = normalized_ai.get('icd10_code') if normalized_ai.get('icd10_code') != "Unknown" else fallback.get('icd10_code')
+            merged['diagnosis_name'] = normalized_ai.get('diagnosis_name') if normalized_ai.get('diagnosis_name') != "Unknown" else fallback.get('diagnosis_name')
+            merged['inpatient'] = normalized_ai.get('inpatient') if normalized_ai.get('inpatient') is not None else fallback.get('inpatient')
+            merged['estimated_stay_days'] = normalized_ai.get('estimated_stay_days') if normalized_ai.get('estimated_stay_days') not in (None, 0) else fallback.get('estimated_stay_days')
+            merged['ward_type'] = normalized_ai.get('ward_type') if normalized_ai.get('ward_type') not in (None, '', 'General') else fallback.get('ward_type')
+            merged['recommended_medicines'] = normalized_ai.get('recommended_medicines') or fallback.get('recommended_medicines')
+            merged['rationale'] = normalized_ai.get('rationale') or fallback.get('rationale')
+            merged['raw_output'] = ai_raw
+            return merged
+
+        # If AI responded OK, normalize and return (give AI precedence)
+        normalized = _normalize_result(parsed if isinstance(parsed, dict) else {}, ai_raw, features)
+        return normalized
+
     except Exception as e:
-        st.error(f"DeepSeek analysis failed: {str(e)}")
-        # Fallback to rule-based system
+        error_msg = str(e)
+        st.error(f"Ollama analysis failed: {error_msg}")
+        # mark AI unavailable on connection/model errors
+        if "connection" in error_msg.lower() or "model" in error_msg.lower():
+            st.session_state['ai_unavailable'] = True
+            st.sidebar.error(f"Ollama server/model unavailable — switched to fallback rules.")
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                log_path = os.path.join(DATA_DIR, "ollama_errors.log")
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"{datetime.datetime.now().isoformat()} - Ollama Error: {error_msg}\n")
+            except Exception:
+                pass
         return fallback_analysis(features)
 
 def fallback_analysis(features: dict) -> dict:
@@ -252,20 +401,44 @@ def calc_severity_score(features: dict) -> int:
 
 # Sidebar configuration
 st.sidebar.header('System Information')
-# indicate DeepSeek availability if known
-if st.session_state.get('deepseek_unavailable', False):
-    st.sidebar.warning("DeepSeek unavailable (insufficient balance or blocked). Using fallback rules.")
+# indicate AI availability and provide operator actions when unavailable
+if st.session_state.get('ai_unavailable', False):
+    st.sidebar.error(f"{OLLAMA_MODEL} unavailable — switched to local fallback rules.")
+    with st.sidebar.expander("Ollama status & actions", expanded=False):
+        log_path = os.path.join(DATA_DIR, "ollama_errors.log")
+        if os.path.exists(log_path):
+            if st.button("Show Ollama error log"):
+                try:
+                    with open(log_path, "r", encoding="utf-8") as fh:
+                        log_text = fh.read()
+                except Exception as _e:
+                    log_text = f"Failed to read log: {_e}"
+                st.code(log_text, language="text")
+        else:
+            st.write("No ollama_errors.log found.")
+
+        if st.button("Mark AI as available (clear flag)"):
+            st.session_state['ai_unavailable'] = False
+            st.sidebar.success("AI marked available. Re-run analysis to attempt again.")
+            safe_rerun()
+
+        st.markdown(
+            "Operator guidance: Ensure Ollama server is running and model is pulled. "
+            "Run `ollama serve` in terminal and `ollama pull meditron:7b` to install the model."
+        )
 else:
-    st.sidebar.success(f"DeepSeek API Connected ({DEEPSEEK_BASE_URL})")
+    st.sidebar.success(f"Ollama Connected ({OLLAMA_HOST})")
+    st.sidebar.info(f"Using model: {OLLAMA_MODEL}")
+
 st.sidebar.info("""
 **AI-Powered Hospital System**
-- No ML models required
-- Real-time clinical decision support
-- Fallback rules when AI unavailable
+- Uses Ollama with Meditron for local clinical decision support
+- No API keys or internet connection required
+- All patient data stays on your machine
 """)
 
 # Main content
-st.title('AI Hospital Management System (DeepSeek R1)')
+st.title('AI Hospital Management System (Ollama Meditron)')
 st.markdown("### Intelligent Patient Admission & Resource Management")
 
 # Patient input form
@@ -296,7 +469,7 @@ with st.form('patient_form'):
         wbc = st.number_input('WBC Count (10^9/L)', value=7.0, step=0.1, min_value=0.0, max_value=50.0)
         crp = st.number_input('CRP Level (mg/L)', value=5.0, step=0.1, min_value=0.0, max_value=300.0)
     
-    submitted = st.form_submit_button('Analyze with DeepSeek AI', type='primary')
+    submitted = st.form_submit_button(f'Analyze with {OLLAMA_MODEL}', type='primary')
 
 if submitted:
     # Calculate severity score
@@ -319,11 +492,11 @@ if submitted:
         'timestamp': datetime.datetime.now()
     }
     
-    # Analyze with DeepSeek AI (or fallback if previously flagged)
-    if st.session_state.get('deepseek_unavailable', False):
+    # Analyze with Ollama AI (or fallback if previously flagged)
+    if st.session_state.get('ai_unavailable', False):
         ai_result = fallback_analysis(features)
     else:
-        ai_result = analyze_with_deepseek(features)
+        ai_result = analyze_with_ollama(features)
     
     if ai_result:
         st.session_state.current_patient['ai_result'] = ai_result
@@ -339,7 +512,7 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
     features = patient['features']
     ai_result = patient.get('ai_result', {})
     
-    st.subheader("DeepSeek AI Clinical Analysis")
+    st.subheader(f"{OLLAMA_MODEL} Clinical Analysis")
     col1, col2 = st.columns([2, 1])
     
     with col1:
@@ -504,4 +677,4 @@ else:
     st.info("No admission history available yet")
 
 st.markdown("---")
-st.caption("AI Hospital Management System • Powered by DeepSeek R1 • © 2025")
+st.caption(f"AI Hospital Management System • Powered by {OLLAMA_MODEL} • Local Inference • © 2025")
