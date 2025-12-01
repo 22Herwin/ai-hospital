@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 import ollama
 from icd10_loader import lookup_icd10
+import concurrent.futures
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -138,32 +139,49 @@ Clinical Severity Assessment:
 def analyze_with_ollama(features: dict) -> dict:
     """
     Analyze patient features using Ollama with Meditron model.
+    Runs the model call in a short-lived thread and enforces a timeout so
+    the UI doesn't hang indefinitely. On timeout/connection error we mark AI
+    as unavailable and return fallback analysis.
     """
     if st.session_state.get('ai_unavailable', False):
         return fallback_analysis(features)
 
     clinical_note = build_clinical_note(features)
-    
-    # Import the AI engine
     from ai_engine import analyze_text_with_ollama
-    
+
+    timeout_seconds = int(os.getenv("OLLAMA_TIMEOUT", "12"))
+
     try:
-        with st.spinner(f"{OLLAMA_MODEL} analyzing clinical presentation..."):
-            ai_result = analyze_text_with_ollama(clinical_note)
-        
+        start = time.time()
+        with st.spinner(f"{OLLAMA_MODEL} analyzing clinical presentation... (timeout {timeout_seconds}s)"):
+            # run model call in a worker thread so we can enforce timeout
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(analyze_text_with_ollama, clinical_note)
+                ai_result = future.result(timeout=timeout_seconds)
+
+        elapsed = time.time() - start
+        # If returned None or malformed, treat as failure and fall back
+        if not ai_result or not isinstance(ai_result, dict):
+            st.warning("AI returned unexpected result — using fallback rules")
+            return fallback_analysis(features)
+
         # Verify ICD-10 code using local ICD loader
         if ai_result and ai_result.get('icd10_code'):
             try:
                 icd_info = lookup_icd10(ai_result['icd10_code'])
                 if icd_info and icd_info.get('title'):
-                    # Use official ICD-10 title if available
                     ai_result['diagnosis_name'] = icd_info.get('title')
-                    st.success(f"ICD-10 Code Validated: {ai_result['icd10_code']}")
+                    st.success(f"ICD-10 Code Validated: {ai_result['icd10_code']} (took {elapsed:.1f}s)")
             except Exception as e:
                 st.warning(f"ICD-10 verification issue: {str(e)}")
-        
+
         return ai_result
-        
+
+    except concurrent.futures.TimeoutError:
+        st.error(f"Ollama call timed out after {timeout_seconds}s — switching to fallback")
+        st.session_state['ai_unavailable'] = True
+        return fallback_analysis(features)
+
     except Exception as e:
         error_msg = str(e)
         st.error(f"Ollama analysis failed: {error_msg}")
@@ -510,3 +528,173 @@ else:
 
 st.markdown("---")
 st.caption(f"AI Hospital Management System • Powered by {OLLAMA_MODEL} • ICD-10 Validated • © 2025")
+
+def deterministic_classifier(features: dict) -> dict:
+    """
+    Stage 1 (deterministic): decide ICD-10 code, name, ward and base meds
+    using rule tables. This MUST be authoritative for diagnosis/code.
+    """
+    # Keep rules aligned with fallback_analysis but return a compact base
+    if features['symptom_cough'] and features['symptom_fever'] and features['lab_wbc'] > 15:
+        base = {'icd10_code': 'J18.9', 'diagnosis_name': 'Pneumonia, unspecified',
+                'inpatient': True, 'estimated_stay_days': 5, 'ward_type': 'General',
+                'recommended_medicines': ['Amoxicillin 500mg TDS', 'Azithromycin 250mg OD']}
+    elif features.get('symptom_chest_pain', False) and features['comorbidity_hypertension']:
+        base = {'icd10_code': 'I21.9', 'diagnosis_name': 'Acute myocardial infarction',
+                'inpatient': True, 'estimated_stay_days': 7, 'ward_type': 'ICU',
+                'recommended_medicines': ['Aspirin 300mg', 'Clopidogrel 75mg']}
+    elif features.get('symptom_neuro', False):
+        base = {'icd10_code': 'I63.9', 'diagnosis_name': 'Cerebral infarction',
+                'inpatient': True, 'estimated_stay_days': 10, 'ward_type': 'Neurological',
+                'recommended_medicines': ['Aspirin 100mg', 'Atorvastatin 40mg']}
+    elif features['symptom_fever'] and features['lab_crp'] > 100:
+        base = {'icd10_code': 'A41.9', 'diagnosis_name': 'Sepsis, unspecified',
+                'inpatient': True, 'estimated_stay_days': 14, 'ward_type': 'ICU',
+                'recommended_medicines': ['Meropenem 1g IV', 'IV Fluids']}
+    elif features['comorbidity_hypertension']:
+        base = {'icd10_code': 'I10', 'diagnosis_name': 'Essential hypertension',
+                'inpatient': False, 'estimated_stay_days': 0, 'ward_type': 'Outpatient',
+                'recommended_medicines': ['Amlodipine 5mg OD', 'Lisinopril 10mg OD']}
+    elif features['comorbidity_diabetes']:
+        base = {'icd10_code': 'E11.9', 'diagnosis_name': 'Type 2 diabetes',
+                'inpatient': False, 'estimated_stay_days': 0, 'ward_type': 'Outpatient',
+                'recommended_medicines': ['Metformin 500mg BD']}
+    else:
+        base = {'icd10_code': 'Z00.0', 'diagnosis_name': 'General medical examination',
+                'inpatient': False, 'estimated_stay_days': 0, 'ward_type': 'Outpatient',
+                'recommended_medicines': ['Routine follow-up']}
+
+    # ensure ICD lookup/title normalization if available
+    try:
+        icd_info = lookup_icd10(base['icd10_code'])
+        if icd_info and icd_info.get('title'):
+            base['diagnosis_name'] = icd_info.get('title')
+    except Exception:
+        pass
+
+    return base
+
+def format_with_ollama(base_result: dict, features: dict, timeout_seconds: Optional[int] = None) -> dict:
+    """
+    Stage 2 (Ollama): provide human-readable explanation, expand meds, set confidence,
+    but DO NOT change the authoritative icd10_code or diagnosis_name from base_result.
+    If Ollama fails or times out, return a merged result using base_result.
+    """
+    from ai_engine import analyze_text_with_ollama
+
+    if timeout_seconds is None:
+        timeout_seconds = int(os.getenv("OLLAMA_TIMEOUT", "12"))
+
+    # Build explicit prompt: do not change diagnosis/code, only expand and output JSON
+    prompt_text = (
+        "You are a clinical assistant. BASE_DIAGNOSIS is authoritative and must NOT be changed.\n"
+        "BASE: code={code}, name={name}\n"
+        "PATIENT FEATURES: {features}\n\n"
+        "Task: Expand clinical rationale, suggest medications (align with provided ward/level), "
+        "and output a JSON object with keys: "
+        "'icd10_code' (must equal BASE code), 'diagnosis_name' (must equal BASE name), "
+        "'confidence' (0-1), 'inpatient' (bool), 'estimated_stay_days' (int), 'ward_type' (string), "
+        "'recommended_medicines' (list of strings), 'rationale' (string).\n"
+        "Return only a parsable JSON object (no surrounding text)."
+    ).format(code=base_result['icd10_code'], name=base_result['diagnosis_name'], features=json.dumps(features))
+
+    try:
+        start = time.time()
+        with st.spinner(f"{OLLAMA_MODEL} formatting explanation... (timeout {timeout_seconds}s)"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(analyze_text_with_ollama, prompt_text)
+                ai_out = future.result(timeout=timeout_seconds)
+
+        # If AI returned a string try to parse JSON, otherwise accept dict
+        if isinstance(ai_out, str):
+            try:
+                ai_parsed = json.loads(ai_out)
+            except Exception:
+                ai_parsed = {}
+        elif isinstance(ai_out, dict):
+            ai_parsed = ai_out
+        else:
+            ai_parsed = {}
+
+        # If parsed dict empty -> fallback to deterministic
+        if not ai_parsed:
+            st.warning("Ollama returned unexpected format; using deterministic result.")
+            merged = {
+                "icd10_code": base_result['icd10_code'],
+                "diagnosis_name": base_result['diagnosis_name'],
+                "confidence": 0.75,
+                "inpatient": base_result['inpatient'],
+                "estimated_stay_days": base_result['estimated_stay_days'],
+                "ward_type": base_result['ward_type'],
+                "recommended_medicines": base_result.get('recommended_medicines', []),
+                "rationale": f"Deterministic diagnosis used. Severity: {features.get('severity_score',0)}/25"
+            }
+            return merged
+
+        # Safe extraction with defaults
+        try:
+            confidence = float(ai_parsed.get('confidence', 0.75))
+        except Exception:
+            confidence = 0.75
+
+        est_raw = ai_parsed.get('estimated_stay_days')
+        if est_raw is None:
+            est_days = base_result['estimated_stay_days']
+        else:
+            try:
+                est_days = int(est_raw)
+            except Exception:
+                est_days = base_result['estimated_stay_days']
+
+        ward_type = ai_parsed.get('ward_type', base_result['ward_type'])
+        inpatient_flag = bool(ai_parsed.get('inpatient', base_result['inpatient']))
+
+        meds = ai_parsed.get('recommended_medicines')
+        if not isinstance(meds, list):
+            meds = base_result.get('recommended_medicines', [])
+
+        rationale = ai_parsed.get('rationale') or ai_parsed.get('explanation') or f"Deterministic diagnosis used. Severity: {features.get('severity_score',0)}/25"
+
+        merged = {
+            "icd10_code": base_result['icd10_code'],
+            "diagnosis_name": base_result['diagnosis_name'],
+            "confidence": confidence,
+            "inpatient": inpatient_flag,
+            "estimated_stay_days": est_days,
+            "ward_type": ward_type,
+            "recommended_medicines": meds,
+            "rationale": rationale
+        }
+
+        # small safety: if meds empty, keep deterministic meds
+        if not merged['recommended_medicines']:
+            merged['recommended_medicines'] = base_result.get('recommended_medicines', [])
+
+        return merged
+
+    except concurrent.futures.TimeoutError:
+        st.error(f"Ollama formatting timed out after {timeout_seconds}s — using deterministic result.")
+        st.session_state['ai_unavailable'] = True
+        return {
+            "icd10_code": base_result['icd10_code'],
+            "diagnosis_name": base_result['diagnosis_name'],
+            "confidence": 0.7,
+            "inpatient": base_result['inpatient'],
+            "estimated_stay_days": base_result['estimated_stay_days'],
+            "ward_type": base_result['ward_type'],
+            "recommended_medicines": base_result.get('recommended_medicines', []),
+            "rationale": f"Deterministic diagnosis used after Ollama timeout. Severity: {features.get('severity_score',0)}/25"
+        }
+
+    except Exception as e:
+        st.warning(f"Ollama formatting failed: {str(e)} — using deterministic result.")
+        return {
+            "icd10_code": base_result['icd10_code'],
+            "diagnosis_name": base_result['diagnosis_name'],
+            "confidence": 0.7,
+            "inpatient": base_result['inpatient'],
+            "estimated_stay_days": base_result['estimated_stay_days'],
+            "ward_type": base_result['ward_type'],
+            "recommended_medicines": base_result.get('recommended_medicines', []),
+            "rationale": f"Deterministic diagnosis used after Ollama error. Severity: {features.get('severity_score',0)}/25"
+        }
