@@ -1,51 +1,52 @@
 import os
 from dotenv import load_dotenv
 import json
-import ollama
+import requests
 from typing import Dict, Any, Optional
 import re
 
 BASE_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Ollama configuration
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "meditron:7b")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# Chutes AI configuration (defaults can be overridden in .env)
+CHUTES_API_URL = os.getenv("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
+CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
+CHUTES_MODEL = os.getenv("CHUTES_MODEL", "deepseek-ai/DeepSeek-R1")
 
 # Define specific disease categories with STRICT criteria
 HOSPITALIZATION_DISEASES = {
     "J18.9": {
-        "name": "Pneumonia, unspecified", 
-        "ward": "General", 
-        "stay_days": 5, 
+        "name": "Pneumonia, unspecified",
+        "ward": "General",
+        "stay_days": 5,
         "meds": ["Amoxicillin 500mg TDS", "Azithromycin 250mg OD", "Paracetamol 500mg PRN"],
         "criteria": "fever + cough + abnormal lung sounds + elevated WBC/CRP"
     },
     "I21.9": {
-        "name": "Acute myocardial infarction, unspecified", 
-        "ward": "ICU", 
-        "stay_days": 7, 
+        "name": "Acute myocardial infarction, unspecified",
+        "ward": "ICU",
+        "stay_days": 7,
         "meds": ["Aspirin 300mg", "Clopidogrel 75mg", "Atorvastatin 80mg"],
         "criteria": "chest pain + ECG changes + elevated cardiac enzymes"
     },
     "I63.9": {
-        "name": "Cerebral infarction, unspecified", 
-        "ward": "Neurological", 
-        "stay_days": 10, 
+        "name": "Cerebral infarction, unspecified",
+        "ward": "Neurological",
+        "stay_days": 10,
         "meds": ["Aspirin 100mg", "Atorvastatin 40mg", "Mannitol IV PRN"],
         "criteria": "neurological deficits + imaging confirmation"
     },
     "A41.9": {
-        "name": "Sepsis, unspecified", 
-        "ward": "ICU", 
-        "stay_days": 14, 
+        "name": "Sepsis, unspecified",
+        "ward": "ICU",
+        "stay_days": 14,
         "meds": ["Meropenem 1g IV", "Vancomycin 1g IV", "IV Fluids"],
         "criteria": "fever + elevated WBC/CRP + systemic symptoms"
     },
     "J15.9": {
-        "name": "Bacterial pneumonia, unspecified", 
-        "ward": "Isolation", 
-        "stay_days": 7, 
+        "name": "Bacterial pneumonia, unspecified",
+        "ward": "Isolation",
+        "stay_days": 7,
         "meds": ["Ceftriaxone 1g IV", "Azithromycin 500mg IV", "Oxygen therapy"],
         "criteria": "fever + cough + purulent sputum + elevated inflammatory markers"
     }
@@ -53,37 +54,37 @@ HOSPITALIZATION_DISEASES = {
 
 OUTPATIENT_DISEASES = {
     "I10": {
-        "name": "Essential (primary) hypertension", 
-        "ward": "Outpatient", 
-        "stay_days": 0, 
+        "name": "Essential (primary) hypertension",
+        "ward": "Outpatient",
+        "stay_days": 0,
         "meds": ["Amlodipine 5mg OD", "Lisinopril 10mg OD"],
         "criteria": "elevated BP without acute complications"
     },
     "E11.9": {
-        "name": "Type 2 diabetes mellitus without complications", 
-        "ward": "Outpatient", 
-        "stay_days": 0, 
+        "name": "Type 2 diabetes mellitus without complications",
+        "ward": "Outpatient",
+        "stay_days": 0,
         "meds": ["Metformin 500mg BD", "Glucose monitoring"],
         "criteria": "elevated glucose without acute complications"
     },
     "J06.9": {
-        "name": "Acute upper respiratory infection, unspecified", 
-        "ward": "Outpatient", 
-        "stay_days": 0, 
+        "name": "Acute upper respiratory infection, unspecified",
+        "ward": "Outpatient",
+        "stay_days": 0,
         "meds": ["Paracetamol 500mg QDS", "Chlorpheniramine 4mg TDS"],
         "criteria": "cough/cold symptoms without systemic illness"
     },
     "K29.70": {
-        "name": "Gastritis, unspecified, without bleeding", 
-        "ward": "Outpatient", 
-        "stay_days": 0, 
+        "name": "Gastritis, unspecified, without bleeding",
+        "ward": "Outpatient",
+        "stay_days": 0,
         "meds": ["Omeprazole 20mg OD", "Antacids PRN"],
         "criteria": "dyspepsia without alarm features"
     },
     "M54.50": {
-        "name": "Low back pain, unspecified", 
-        "ward": "Outpatient", 
-        "stay_days": 0, 
+        "name": "Low back pain, unspecified",
+        "ward": "Outpatient",
+        "stay_days": 0,
         "meds": ["Ibuprofen 400mg TDS", "Muscle relaxants PRN"],
         "criteria": "mechanical back pain without neurological deficits"
     }
@@ -91,9 +92,9 @@ OUTPATIENT_DISEASES = {
 
 HEALTHY_CODE = {
     "Z00.0": {
-        "name": "General medical examination", 
-        "ward": "Outpatient", 
-        "stay_days": 0, 
+        "name": "General medical examination",
+        "ward": "Outpatient",
+        "stay_days": 0,
         "meds": ["Routine follow-up"],
         "criteria": "no acute symptoms, normal examination"
     }
@@ -141,43 +142,84 @@ OUTPUT FORMAT - JSON ONLY:
 IMPORTANT: Be CONSERVATIVE. Only diagnose serious conditions when clear evidence exists.
 """
 
-def call_ollama_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model: str = OLLAMA_MODEL, temperature: float = 0.1) -> Optional[Dict[str, Any]]:
+def call_chutes_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model: str = CHUTES_MODEL, temperature: float = 0.1) -> Optional[Dict[str, Any]]:
     """
-    Calls Ollama chat completions endpoint for local model inference.
+    Calls Chutes AI chat completions endpoint via HTTP.
     Returns parsed JSON dict or None on failure.
     """
+    if not CHUTES_API_TOKEN:
+        # No token configured
+        raise RuntimeError("CHUTES_API_TOKEN not set in environment")
+
+    headers = {
+        "Authorization": f"Bearer {CHUTES_API_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_user}
+        ],
+        "temperature": temperature,
+        # providers often accept top_p/top_k, keep safe defaults omitted here
+    }
+
     try:
-        # Configure ollama client
-        client = ollama.Client(host=OLLAMA_HOST)
-        
-        # Make the API call
-        response = client.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt_user}
-            ],
-            format="json",
-            options={
-                "temperature": temperature,  # Low temperature for consistent medical diagnosis
-                "num_ctx": 4096,
-                "top_k": 40,
-                "top_p": 0.9
-            }
-        )
-        
-        content = response["message"]["content"]
-        
-        # Clean and parse JSON response
-        content_clean = content.strip()
-        
+        r = requests.post(CHUTES_API_URL, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+
+        # Try to extract message content from common fields
+        content = None
+        # Common OpenAI-like response structure
+        if isinstance(j, dict) and "choices" in j and isinstance(j["choices"], list) and len(j["choices"]) > 0:
+            choice = j["choices"][0]
+            # try chat message
+            if isinstance(choice.get("message"), dict) and choice["message"].get("content"):
+                content = choice["message"]["content"]
+            # or text field
+            elif choice.get("text"):
+                content = choice.get("text")
+            # or delta/content streaming
+            elif choice.get("output"):
+                content = choice.get("output")
+        # Some providers return top-level 'message' or 'content'
+        if content is None:
+            if isinstance(j.get("message"), dict) and j["message"].get("content"):
+                content = j["message"]["content"]
+            elif isinstance(j.get("content"), str):
+                content = j.get("content")
+            elif isinstance(j.get("output"), str):
+                content = j.get("output")
+            else:
+                # as last resort, stringify entire response
+                content = json.dumps(j)
+
+        # Ensure content is a string before calling strip()
+        if isinstance(content, str):
+            content_clean = content.strip()
+        else:
+            # If content is None use empty string; if it's another type serialize to JSON,
+            # otherwise fall back to Python's str() representation.
+            if content is None:
+                content_clean = ""
+            else:
+                try:
+                    content_clean = json.dumps(content)
+                except Exception:
+                    content_clean = str(content)
+            content_clean = content_clean.strip()
+
         # Remove any markdown code blocks if present
         if content_clean.startswith('```json'):
             content_clean = content_clean[7:]
         if content_clean.endswith('```'):
             content_clean = content_clean[:-3]
         content_clean = content_clean.strip()
-        
+
         try:
             return json.loads(content_clean)
         except json.JSONDecodeError as e:
@@ -190,43 +232,46 @@ def call_ollama_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model
                     raise RuntimeError(f"Failed to parse JSON from model output: {e}\nRaw:\n{content_clean}")
             else:
                 raise RuntimeError(f"Model output is not valid JSON:\n{content_clean}")
-            
+
     except Exception as e:
-        print(f"Ollama inference error: {str(e)}")
+        # Bubble up as None for callers to fallback
+        print(f"Chutes inference error: {str(e)}")
         return None
 
-def analyze_text_with_ollama(text: str) -> Dict[str, Any]:
+
+def analyze_text_with_chutes(text: str) -> Dict[str, Any]:
     """
-    High-level wrapper that calls the model for clinical analysis.
+    High-level wrapper that calls the model for clinical analysis using Chutes.
     """
     # Build the final prompt with clinical data
     clinical_prompt = f"""
     Analyze this patient case CONSERVATIVELY. Only diagnose serious conditions when clear evidence exists.
-    
+
     CLINICAL DATA:
     {text}
-    
+
     REMEMBER: Default to Z00.0 (healthy examination) if no significant abnormalities.
-    
+
     Return valid JSON with: icd10_code, diagnosis_name, inpatient, estimated_stay_days, ward_type, recommended_medicines, and rationale.
     """
-    
-    res = call_ollama_chat(clinical_prompt)
-    
+
+    res = call_chutes_chat(clinical_prompt)
+
     if res is None:
         return fallback_analysis(text)
-    
+
     return normalize_ai_response(res)
+
 
 def fallback_analysis(text: str) -> Dict[str, Any]:
     """
     Rule-based fallback analysis when AI is unavailable - VERY CONSERVATIVE
     """
     import re
-    
+
     # Extract symptoms from text
     text_lower = text.lower()
-    
+
     # Check for specific patterns - be very conservative
     has_fever = re.search(r'\bfever\b|\btemperature\b|\btemp\b|\bpyrexia\b', text_lower)
     has_cough = re.search(r'\bcough\b|\bcoughing\b', text_lower)
@@ -236,43 +281,51 @@ def fallback_analysis(text: str) -> Dict[str, Any]:
     has_diabetes = re.search(r'\bdiabet\b|\bsugar\b|\bglucose\b', text_lower)
     has_neuro = re.search(r'\bweakness\b|\bnumbness\b|\bparalysis\b|\bstroke\b', text_lower)
     has_sepsis = re.search(r'\bsepsis\b|\bseptic\b|\binfection\b', text_lower)
-    
+
     # Extract lab values using regex
     wbc_match = re.search(r'WBC[:\s]*([0-9.]+)', text, re.IGNORECASE)
     crp_match = re.search(r'CRP[:\s]*([0-9.]+)', text, re.IGNORECASE)
     temp_match = re.search(r'Temperature[:\s]*([0-9.]+)', text, re.IGNORECASE)
     bp_match = re.search(r'Blood Pressure[:\s]*([0-9]+)/([0-9]+)', text, re.IGNORECASE)
-    
+
     wbc_value = float(wbc_match.group(1)) if wbc_match else 7.0
     crp_value = float(crp_match.group(1)) if crp_match else 5.0
     temp_value = float(temp_match.group(1)) if temp_match else 36.7
     bp_sys = int(bp_match.group(1)) if bp_match else 120
     bp_dia = int(bp_match.group(2)) if bp_match else 80
-    
+
     # VERY CONSERVATIVE diagnosis - require clear evidence
     if has_fever and has_cough and has_breathless and wbc_value > 13 and crp_value > 50:
         diagnosis = HOSPITALIZATION_DISEASES["J18.9"]  # Pneumonia - strict criteria
+        code = "J18.9"
     elif has_chest_pain and has_hypertension and bp_sys > 180:
         diagnosis = HOSPITALIZATION_DISEASES["I21.9"]  # MI - strict criteria
+        code = "I21.9"
     elif has_neuro:
         diagnosis = HOSPITALIZATION_DISEASES["I63.9"]  # Stroke
+        code = "I63.9"
     elif has_sepsis and has_fever and crp_value > 100:
         diagnosis = HOSPITALIZATION_DISEASES["A41.9"]  # Sepsis - strict criteria
+        code = "A41.9"
     elif has_hypertension and bp_sys > 140:
         diagnosis = OUTPATIENT_DISEASES["I10"]  # Hypertension
+        code = "I10"
     elif has_diabetes:
         diagnosis = OUTPATIENT_DISEASES["E11.9"]  # Diabetes
+        code = "E11.9"
     elif has_cough or has_fever:
         diagnosis = OUTPATIENT_DISEASES["J06.9"]  # URI
+        code = "J06.9"
     else:
         # DEFAULT TO HEALTHY if no clear evidence of disease
         diagnosis = HEALTHY_CODE["Z00.0"]
-    
+        code = "Z00.0"
+
     # Determine if inpatient based on diagnosis category
-    is_inpatient = diagnosis["icd10_code"] in HOSPITALIZATION_DISEASES if "icd10_code" in diagnosis else diagnosis in HOSPITALIZATION_DISEASES.values()
-    
+    is_inpatient = code in HOSPITALIZATION_DISEASES
+
     return {
-        "icd10_code": list(diagnosis.keys())[0] if isinstance(diagnosis, dict) and "icd10_code" not in diagnosis else diagnosis.get("icd10_code", "Z00.0"),
+        "icd10_code": code,
         "diagnosis_name": diagnosis["name"],
         "confidence": 0.6,
         "inpatient": is_inpatient,
@@ -281,6 +334,7 @@ def fallback_analysis(text: str) -> Dict[str, Any]:
         "recommended_medicines": diagnosis["meds"],
         "rationale": f"Conservative fallback analysis: {diagnosis['name']}. Using strict criteria to avoid over-diagnosis."
     }
+
 
 def normalize_ai_response(response: Dict) -> Dict[str, Any]:
     """
@@ -297,7 +351,7 @@ def normalize_ai_response(response: Dict) -> Dict[str, Any]:
         "recommended_medicines": response.get("recommended_medicines", ["Supportive care"]),
         "rationale": response.get("rationale", "Clinical assessment completed")
     }
-    
+
     # Validate ICD-10 code against our defined diseases
     icd_code = out["icd10_code"]
     if icd_code in HOSPITALIZATION_DISEASES:
@@ -330,9 +384,9 @@ def normalize_ai_response(response: Dict) -> Dict[str, Any]:
         out["estimated_stay_days"] = 0
         out["recommended_medicines"] = ["Routine follow-up"]
         out["rationale"] = "Unknown diagnosis code - defaulting to healthy examination"
-    
+
     # Ensure lists are actually lists
     if not isinstance(out["recommended_medicines"], list):
         out["recommended_medicines"] = ["Supportive care"]
-    
+
     return out
