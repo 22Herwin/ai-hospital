@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from icd10_loader import lookup_icd10
 import concurrent.futures
+import plotly.graph_objects as go
+import plotly.express as px
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -194,6 +196,43 @@ def find_available_hospital(requested_ward: str, hospitals_df: pd.DataFrame) -> 
         }
     except Exception:
         return None
+
+def check_ward_capacity_and_alert(requested_ward: str, hospitals_df: pd.DataFrame) -> Tuple[bool, str]:
+    """Check aggregate capacity for a ward type and return (has_capacity, message)."""
+    try:
+        df = hospitals_df.copy()
+        # Ensure numeric columns exist
+        if 'total_beds' not in df.columns or 'occupied_beds' not in df.columns:
+            return False, "Hospital data missing bed information."
+
+        df['total_beds'] = pd.to_numeric(df['total_beds'], errors='coerce').fillna(0).astype(int)
+        df['occupied_beds'] = pd.to_numeric(df['occupied_beds'], errors='coerce').fillna(0).astype(int)
+
+        matching = df[df['ward_type'].str.lower() == str(requested_ward).lower()]
+        if matching.empty:
+            return False, f"No wards of type '{requested_ward}' found in hospital list."
+
+        total_beds = int(matching['total_beds'].sum())
+        total_occupied = int(matching['occupied_beds'].sum())
+        total_available = total_beds - total_occupied
+        occupancy_pct = int((total_occupied / total_beds) * 100) if total_beds > 0 else 100
+
+        if total_available > 0:
+            msg = f"{total_available} bed(s) available across {matching['hospital_name'].nunique()} hospital(s) for '{requested_ward}' ({occupancy_pct}% occupied)."
+            return True, msg
+        else:
+            # No beds available
+            if occupancy_pct >= 95:
+                note = "CRITICAL - no beds, consider overflow/transfer."
+            elif occupancy_pct >= 85:
+                note = "WARNING - capacity critically low."
+            else:
+                note = "No beds available at the moment."
+            msg = f"No available beds for '{requested_ward}' ({occupancy_pct}% occupied). {note}"
+            return False, msg
+    except Exception as e:
+        return False, f"Capacity check error: {str(e)}"
+
 
 def build_clinical_note(features: dict) -> str:
     """Build comprehensive clinical note for AI analysis"""
@@ -630,6 +669,15 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                     )
 
                 if st.button('CONFIRM ADMISSION', type='primary', use_container_width=True):
+                    # Check current capacity before admission
+                    has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
+                    
+                    st.info(capacity_msg)
+                    
+                    if not has_capacity:
+                        st.error(f"Cannot admit: {capacity_msg}")
+                        st.stop()
+                    
                     # Create admission record with hospital info
                     admission_data = {
                         'patient_id': patient['pid'],
@@ -663,6 +711,12 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                     save_stock(stock_df)
 
                     st.success(f"Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
+                    
+                    # Check capacity AFTER admission and warn if critically low
+                    has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
+                    if occupancy_pct >= 85:
+                        st.warning(f"POST-ADMISSION ALERT: {capacity_msg}")
+                    
                     st.balloons()
                     st.session_state.last_admission_id = patient['pid']
                     st.session_state.admission_complete = True
@@ -698,6 +752,187 @@ if os.path.exists(PATIENTS_LOG):
         st.error(f"Error loading admission log: {str(e)}")
 else:
     st.info("No admission history available yet")
+
+# <-- NEW: Ward Capacity Monitor (Graphical)
+st.markdown("---")
+st.subheader("Ward Capacity Monitor & Auto-Routing Status")
+
+hospitals_df = load_hospitals()
+
+# Prepare data for visualizations
+ward_summary = []
+for ward_type in ['General', 'ICU', 'Neurological']:
+    df = hospitals_df.copy()
+    df['total_beds'] = pd.to_numeric(df['total_beds'], errors='coerce').fillna(0).astype(int)
+    df['occupied_beds'] = pd.to_numeric(df['occupied_beds'], errors='coerce').fillna(0).astype(int)
+    
+    matching = df[df['ward_type'].str.lower() == ward_type.lower()]
+    if matching.empty:
+        continue
+    
+    total_beds = int(matching['total_beds'].sum())
+    total_occupied = int(matching['occupied_beds'].sum())
+    total_available = total_beds - total_occupied
+    occupancy_pct = int((total_occupied / total_beds) * 100) if total_beds > 0 else 0
+    
+    ward_summary.append({
+        'ward_type': ward_type,
+        'total_beds': total_beds,
+        'occupied_beds': total_occupied,
+        'available_beds': total_available,
+        'occupancy_pct': occupancy_pct
+    })
+
+# Create tabs for different views
+tab1, tab2 = st.tabs(["Overall Summary", "Per-Hospital Breakdown"])
+
+# Tab 1: Overall Summary Charts
+with tab1:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Bar chart: Occupancy by Ward Type
+        fig_bar = go.Figure()
+        for item in ward_summary:
+            fig_bar.add_trace(go.Bar(
+                x=[item['ward_type']],
+                y=[item['occupancy_pct']],
+                name=item['ward_type'],
+                text=f"{item['occupancy_pct']}%",
+                textposition='outside',
+                marker=dict(
+                    color='red' if item['occupancy_pct'] >= 95 else
+                           'orange' if item['occupancy_pct'] >= 85 else
+                           'yellow' if item['occupancy_pct'] >= 70 else 'green'
+                )
+            ))
+        
+        fig_bar.update_layout(
+            title="Ward Occupancy % by Type",
+            yaxis_title="Occupancy %",
+            xaxis_title="Ward Type",
+            showlegend=False,
+            height=400,
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+    
+    with col2:
+        # Stacked bar: Occupied vs Available beds
+        fig_stack = go.Figure()
+        ward_types = [item['ward_type'] for item in ward_summary]
+        occupied = [item['occupied_beds'] for item in ward_summary]
+        available = [item['available_beds'] for item in ward_summary]
+        
+        fig_stack.add_trace(go.Bar(
+            x=ward_types,
+            y=occupied,
+            name='Occupied Beds',
+            marker_color='indianred'
+        ))
+        fig_stack.add_trace(go.Bar(
+            x=ward_types,
+            y=available,
+            name='Available Beds',
+            marker_color='lightgreen'
+        ))
+        
+        fig_stack.update_layout(
+            barmode='stack',
+            title="Bed Availability by Ward Type",
+            yaxis_title="Number of Beds",
+            xaxis_title="Ward Type",
+            height=400,
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig_stack, use_container_width=True)
+
+# Tab 2: Per-Hospital Breakdown
+with tab2:
+    # Create breakdown data
+    hospital_breakdown = []
+    for _, row in hospitals_df.iterrows():
+        hospital_breakdown.append({
+            'Hospital': row['hospital_name'],
+            'Ward': row['ward_type'],
+            'Total Beds': int(row['total_beds']),
+            'Occupied': int(row['occupied_beds']),
+            'Available': int(row['total_beds']) - int(row['occupied_beds']),
+            'Occupancy %': int((int(row['occupied_beds']) / int(row['total_beds']) * 100) if int(row['total_beds']) > 0 else 0)
+        })
+    
+    breakdown_df = pd.DataFrame(hospital_breakdown)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Grouped bar chart by hospital and ward
+        fig_grouped = px.bar(
+            breakdown_df,
+            x='Ward',
+            y='Occupancy %',
+            color='Hospital',
+            barmode='group',
+            title="Occupancy % by Hospital & Ward",
+            height=400
+        )
+        fig_grouped.update_yaxes(range=[0, 105])
+        st.plotly_chart(fig_grouped, use_container_width=True)
+    
+    with col2:
+        # Heatmap: Hospital vs Ward Occupancy
+        pivot_df = breakdown_df.pivot_table(
+            index='Hospital',
+            columns='Ward',
+            values='Occupancy %',
+            aggfunc=lambda x: x.iloc[0] if len(x) > 0 else None
+        )
+        
+        fig_heatmap = go.Figure(data=go.Heatmap(
+            z=pivot_df.values,
+            x=pivot_df.columns,
+            y=pivot_df.index,
+            colorscale='RdYlGn_r',
+            text=pivot_df.values,
+            texttemplate='%{text:.0f}%',
+            textfont={"size": 12},
+            colorbar=dict(title="Occupancy %")
+        ))
+        
+        fig_heatmap.update_layout(
+            title="Hospital & Ward Occupancy Heatmap",
+            xaxis_title="Ward Type",
+            yaxis_title="Hospital",
+            height=400
+        )
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+    
+    # Table view
+    st.write("**Detailed Breakdown:**")
+    st.dataframe(breakdown_df, width='stretch', hide_index=True)
+
+# Summary statistics
+st.markdown("---")
+col1, col2, col3, col4 = st.columns(4)
+
+total_beds_all = sum([item['total_beds'] for item in ward_summary])
+total_occupied_all = sum([item['occupied_beds'] for item in ward_summary])
+total_available_all = sum([item['available_beds'] for item in ward_summary])
+avg_occupancy = int((total_occupied_all / total_beds_all * 100) if total_beds_all > 0 else 0)
+
+with col1:
+    st.metric("Total Beds", total_beds_all)
+
+with col2:
+    st.metric("Occupied Beds", total_occupied_all)
+
+with col3:
+    st.metric("Available Beds", total_available_all)
+
+with col4:
+    st.metric("Average Occupancy", f"{avg_occupancy}%")
+
+# <-- END NEW
 
 # Hospital management
 st.markdown("---")
