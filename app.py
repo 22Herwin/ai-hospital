@@ -15,7 +15,7 @@ import concurrent.futures
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Chutes AI configuration
-CHUTES_MODEL = os.getenv("CHUTES_MODEL", "deepseek-ai/DeepSeek-R1")
+CHUTES_MODEL = os.getenv("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
 CHUTES_API_URL = os.getenv("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
 CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
 
@@ -47,6 +47,7 @@ st.set_page_config(page_title='AI Hospital Management System', layout='wide')
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 STOCK_CSV = os.path.join(DATA_DIR, 'medicine_stock.csv')
+HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv')  # <-- new
 PATIENTS_LOG = os.path.join(DATA_DIR, 'admission_log.csv')
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -107,6 +108,93 @@ def save_stock(df):
         st.error(f"Error saving stock: {str(e)}")
         return False
 
+@st.cache_resource
+def load_hospitals():
+    """Load hospitals with ward capacity and occupancy; create defaults if missing."""
+    try:
+        if os.path.exists(HOSPITALS_CSV):
+            df = pd.read_csv(HOSPITALS_CSV)
+            # Ensure columns exist and are numeric; if missing, initialize with zeros
+            if 'total_beds' in df.columns:
+                df['total_beds'] = pd.to_numeric(df['total_beds'], errors='coerce').fillna(0).astype(int)
+            else:
+                df['total_beds'] = 0
+            if 'occupied_beds' in df.columns:
+                df['occupied_beds'] = pd.to_numeric(df['occupied_beds'], errors='coerce').fillna(0).astype(int)
+            else:
+                df['occupied_beds'] = 0
+            return df
+        else:
+            # Create default hospitals with ward capacity
+            default = [
+                {'hospital_id': 'H-01', 'hospital_name': 'Central Medical Hospital', 'ward_type': 'General', 'total_beds': 20, 'occupied_beds': 15},
+                {'hospital_id': 'H-02', 'hospital_name': 'Central Medical Hospital', 'ward_type': 'ICU', 'total_beds': 6, 'occupied_beds': 4},
+                {'hospital_id': 'H-03', 'hospital_name': 'Central Medical Hospital', 'ward_type': 'Neurological', 'total_beds': 8, 'occupied_beds': 3},
+                {'hospital_id': 'H-04', 'hospital_name': 'City General Hospital', 'ward_type': 'General', 'total_beds': 25, 'occupied_beds': 8},
+                {'hospital_id': 'H-05', 'hospital_name': 'City General Hospital', 'ward_type': 'ICU', 'total_beds': 8, 'occupied_beds': 2},
+                {'hospital_id': 'H-06', 'hospital_name': 'City General Hospital', 'ward_type': 'Neurological', 'total_beds': 10, 'occupied_beds': 5},
+            ]
+            df = pd.DataFrame(default)
+            df.to_csv(HOSPITALS_CSV, index=False)
+            return df
+    except Exception as e:
+        st.error(f"Error loading hospitals: {e}")
+        return pd.DataFrame(columns=['hospital_id', 'hospital_name', 'ward_type', 'total_beds', 'occupied_beds'])
+
+def save_hospitals(df: pd.DataFrame):
+    """Persist hospitals CSV and clear cache."""
+    try:
+        df.to_csv(HOSPITALS_CSV, index=False)
+        load_hospitals.clear()
+        return True
+    except Exception as e:
+        st.error(f"Error saving hospitals: {e}")
+        return False
+
+def find_available_hospital(requested_ward: str, hospitals_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Find a hospital ward row with available beds for the requested ward type.
+
+    Returns a dict with hospital fields and computed 'available_beds', or None if none found.
+    """
+    try:
+        # Ensure numeric types
+        df = hospitals_df.copy()
+        if 'total_beds' not in df.columns or 'occupied_beds' not in df.columns:
+            return None
+        df['total_beds'] = pd.to_numeric(df['total_beds'], errors='coerce').fillna(0).astype(int)
+        df['occupied_beds'] = pd.to_numeric(df['occupied_beds'], errors='coerce').fillna(0).astype(int)
+
+        # Filter by requested ward type (case-insensitive)
+        candidates = df[df['ward_type'].str.lower() == str(requested_ward).lower()].copy()
+        if candidates.empty:
+            return None
+
+        # Compute available beds
+        candidates['available_beds'] = candidates['total_beds'] - candidates['occupied_beds']
+        candidates = candidates[candidates['available_beds'] > 0]
+
+        if candidates.empty:
+            return None
+
+        # Prefer hospital with most available beds, tie-breaker: lowest occupancy %
+        candidates['occupancy_pct'] = candidates.apply(
+            lambda r: (r['occupied_beds'] / r['total_beds']) if r['total_beds'] > 0 else 1.0,
+            axis=1
+        )
+        candidates = candidates.sort_values(by=['available_beds', 'occupancy_pct'], ascending=[False, True])
+
+        row = candidates.iloc[0]
+        return {
+            'hospital_id': row.get('hospital_id'),
+            'hospital_name': row.get('hospital_name'),
+            'ward_type': row.get('ward_type'),
+            'total_beds': int(row.get('total_beds', 0)),
+            'occupied_beds': int(row.get('occupied_beds', 0)),
+            'available_beds': int(row.get('available_beds', 0))
+        }
+    except Exception:
+        return None
+
 def build_clinical_note(features: dict) -> str:
     """Build comprehensive clinical note for AI analysis"""
     return f"""
@@ -143,10 +231,7 @@ Clinical Severity Assessment:
 
 def analyze_with_chutes(features: dict) -> dict:
     """
-    Analyze patient features using Chutes AI.
-    Runs the model call in a short-lived thread and enforces a timeout so
-    the UI doesn't hang indefinitely. On timeout/connection error we mark AI
-    as unavailable and return fallback analysis.
+    Analyze patient features using Chutes AI with retry, logging and a configurable timeout.
     """
     if st.session_state.get('ai_unavailable', False):
         return fallback_analysis(features)
@@ -154,24 +239,34 @@ def analyze_with_chutes(features: dict) -> dict:
     clinical_note = build_clinical_note(features)
     from ai_engine import analyze_text_with_chutes
 
-    timeout_seconds = int(os.getenv("CHUTES_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "12")))
+    # configurable timeout (set CHUTES_TIMEOUT in .env). Default increased to 30s.
+    timeout_seconds = int(os.getenv("CHUTES_TIMEOUT", "30"))
+    raw_log = os.path.join(DATA_DIR, "chutes_raw_responses.log")
+    attempts = 2
 
-    try:
-        start = time.time()
-        with st.spinner(f"{CHUTES_MODEL} analyzing clinical presentation... (timeout {timeout_seconds}s)"):
-            # run model call in a worker thread so we can enforce timeout
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(analyze_text_with_chutes, clinical_note)
-                ai_result = future.result(timeout=timeout_seconds)
+    for attempt in range(1, attempts + 1):
+        try:
+            start = time.time()
+            with st.spinner(f"{CHUTES_MODEL} analyzing clinical presentation... (timeout {timeout_seconds}s) [attempt {attempt}/{attempts}]"):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(analyze_text_with_chutes, clinical_note)
+                    ai_result = future.result(timeout=timeout_seconds)
 
-        elapsed = time.time() - start
-        # If returned None or malformed, treat as failure and fall back
-        if not ai_result or not isinstance(ai_result, dict):
-            st.warning("AI returned unexpected result — using fallback rules")
-            return fallback_analysis(features)
+            elapsed = time.time() - start
 
-        # Verify ICD-10 code using local ICD loader
-        if ai_result and ai_result.get('icd10_code'):
+            # Log raw response for debugging (safe: truncated)
+            try:
+                with open(raw_log, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat()} | attempt={attempt} | elapsed={elapsed:.2f}s | raw={repr(ai_result)[:4000]}\n")
+            except Exception:
+                pass
+
+            # Validate result
+            if not ai_result or not isinstance(ai_result, dict) or not ai_result.get("icd10_code"):
+                st.warning("AI returned unexpected or incomplete result — using fallback rules")
+                return fallback_analysis(features)
+
+            # Verify ICD-10 code using local ICD loader
             try:
                 icd_info = lookup_icd10(ai_result['icd10_code'])
                 if icd_info and icd_info.get('title'):
@@ -180,20 +275,40 @@ def analyze_with_chutes(features: dict) -> dict:
             except Exception as e:
                 st.warning(f"ICD-10 verification issue: {str(e)}")
 
-        return ai_result
+            return ai_result
 
-    except concurrent.futures.TimeoutError:
-        st.error(f"Chutes AI call timed out after {timeout_seconds}s — switching to fallback")
-        st.session_state['ai_unavailable'] = True
-        return fallback_analysis(features)
-
-    except Exception as e:
-        error_msg = str(e)
-        st.error(f"Chutes AI analysis failed: {error_msg}")
-        if "connection" in error_msg.lower() or "token" in error_msg.lower():
+        except concurrent.futures.TimeoutError:
+            # timeout: retry once, then mark unavailable
+            msg = f"Chutes AI call timed out after {timeout_seconds}s (attempt {attempt}/{attempts})"
+            st.warning(msg)
+            with open(raw_log, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.datetime.now().isoformat()} | TIMEOUT | attempt={attempt}\n")
+            if attempt < attempts:
+                time.sleep(1)  # short backoff then retry
+                continue
+            st.error(msg + " — switching to fallback")
             st.session_state['ai_unavailable'] = True
-            st.sidebar.error("Chutes AI server/token unavailable — switched to fallback rules.")
-        return fallback_analysis(features)
+            return fallback_analysis(features)
+
+        except Exception as e:
+            # other errors: log and fallback
+            err = str(e)
+            try:
+                with open(raw_log, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat()} | ERROR | attempt={attempt} | err={err[:2000]}\n")
+            except Exception:
+                pass
+            if "token" in err.lower() or "connection" in err.lower():
+                st.session_state['ai_unavailable'] = True
+                st.sidebar.error("Chutes AI token/connection issue — switched to fallback rules.")
+            # on first attempt try again, otherwise fallback
+            if attempt < attempts:
+                time.sleep(1)
+                continue
+            return fallback_analysis(features)
+
+    # Ensure a dict is always returned on every code path (static checkers require this)
+    return fallback_analysis(features)
 
 def fallback_analysis(features: dict) -> dict:
     """Fallback rule-based analysis when AI fails"""
@@ -291,6 +406,24 @@ if st.session_state.get('ai_unavailable', False):
 else:
     st.sidebar.success(f"Chutes AI Connected")
     st.sidebar.info(f"Model: {CHUTES_MODEL}")
+
+# <-- NEW: Hospital Occupancy Display
+with st.sidebar.expander("Hospital Occupancy Status", expanded=True):
+    hospitals_df = load_hospitals()
+    unique_hospitals = hospitals_df['hospital_name'].unique()
+    
+    for hospital_name in unique_hospitals:
+        st.write(f"**{hospital_name}**")
+        hospital_wards = hospitals_df[hospitals_df['hospital_name'] == hospital_name]
+        
+        for _, row in hospital_wards.iterrows():
+            available = int(row['total_beds']) - int(row['occupied_beds'])
+            occupancy_pct = int((int(row['occupied_beds']) / int(row['total_beds'])) * 100)
+            status_color = "🔴" if occupancy_pct >= 90 else "🟡" if occupancy_pct >= 70 else "🟢"
+            st.caption(f"{status_color} {row['ward_type']}: {available}/{int(row['total_beds'])} beds ({occupancy_pct}%)")
+        
+        st.divider()
+# <-- END NEW
 
 st.sidebar.info("""
 **Clinical Decision Support**
@@ -444,65 +577,97 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
         st.subheader("Admission Workflow")
 
         stock_df = load_stock()
+        hospitals_df = load_hospitals()
         recommended_meds = ai_result.get('recommended_medicines', [])
+        requested_ward = ai_result.get('ward_type', 'General')
 
-        # Filter available medicines
-        available_meds = stock_df[
-            stock_df['medicine_name'].apply(lambda x: any(med in x for med in recommended_meds)) &
-            (stock_df['stock'] > 0)
-        ]
+        # Find available hospital for requested ward type
+        available_hospital = find_available_hospital(requested_ward, hospitals_df)
 
-        if available_meds.empty:
-            st.warning("No recommended medicines in stock. Please replenish inventory.")
+        if available_hospital is None:
+            st.error(f"No beds available in any hospital for {requested_ward} ward")
+            st.info("All hospitals are at full capacity for the requested ward type. Consider:")
+            st.write("- Placing patient on waiting list")
+            st.write("- Transferring to another hospital type")
+            st.write("- Delaying non-urgent admission")
         else:
+            # Show selected hospital info
             col1, col2 = st.columns(2)
             with col1:
-                selected_med = st.selectbox(
-                    'Select Medication to Assign',
-                    available_meds['medicine_name'].tolist(),
-                    help="Choose from available in-stock medications"
-                )
-
+                st.success(f"Hospital Assignment")
+                st.write(f"**Hospital:** {available_hospital['hospital_name']}")
+                st.write(f"**Ward Type:** {available_hospital['ward_type']}")
+                st.write(f"**Available Beds:** {available_hospital['available_beds']}/{available_hospital['total_beds']}")
+            
             with col2:
-                current_stock = available_meds[available_meds['medicine_name'] == selected_med]['stock'].values[0]
-                qty = st.number_input(
-                    'Quantity to Assign',
-                    min_value=1,
-                    max_value=int(current_stock),
-                    value=1,
-                    help=f"Available stock: {current_stock}"
-                )
+                st.info(f"**Occupancy:** {int((available_hospital['occupied_beds'] / available_hospital['total_beds']) * 100)}%")
 
-            if st.button('CONFIRM ADMISSION', type='primary', use_container_width=True):
-                # Create admission record
-                admission_data = {
-                    'patient_id': patient['pid'],
-                    'admit_time': patient['timestamp'].isoformat(),
-                    'ward_type': ai_result.get('ward_type', 'General'),
-                    'estimated_days': ai_result.get('estimated_stay_days', 3),
-                    'med_used': selected_med,
-                    'qty': int(qty),
-                    'diagnosis_code': ai_result.get('icd10_code', 'Unknown'),
-                    'diagnosis_name': ai_result.get('diagnosis_name', 'Unknown'),
-                    'severity_score': patient['severity_score']
-                }
+            # Filter available medicines
+            available_meds = stock_df[
+                stock_df['medicine_name'].apply(lambda x: any(med in x for med in recommended_meds)) &
+                (stock_df['stock'] > 0)
+            ]
 
-                # Save admission to log
-                os.makedirs(DATA_DIR, exist_ok=True)
-                admission_df = pd.DataFrame([admission_data])
-                if os.path.exists(PATIENTS_LOG):
-                    admission_df.to_csv(PATIENTS_LOG, mode='a', header=False, index=False)
-                else:
-                    admission_df.to_csv(PATIENTS_LOG, index=False)
+            if available_meds.empty:
+                st.warning("No recommended medicines in stock. Please replenish inventory.")
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    selected_med = st.selectbox(
+                        'Select Medication to Assign',
+                        available_meds['medicine_name'].tolist(),
+                        help="Choose from available in-stock medications"
+                    )
 
-                # Update stock
-                stock_df.loc[stock_df['medicine_name'] == selected_med, 'stock'] -= qty
-                save_stock(stock_df)
+                with col2:
+                    current_stock = available_meds[available_meds['medicine_name'] == selected_med]['stock'].values[0]
+                    qty = st.number_input(
+                        'Quantity to Assign',
+                        min_value=1,
+                        max_value=int(current_stock),
+                        value=1,
+                        help=f"Available stock: {current_stock}"
+                    )
 
-                st.success(f"Patient {patient['pid']} admitted to {admission_data['ward_type']} ward")
-                st.session_state.last_admission_id = patient['pid']
-                st.session_state.admission_complete = True
-                safe_rerun()
+                if st.button('CONFIRM ADMISSION', type='primary', use_container_width=True):
+                    # Create admission record with hospital info
+                    admission_data = {
+                        'patient_id': patient['pid'],
+                        'admit_time': patient['timestamp'].isoformat(),
+                        'hospital_id': available_hospital['hospital_id'],
+                        'hospital_name': available_hospital['hospital_name'],
+                        'ward_type': available_hospital['ward_type'],
+                        'estimated_days': ai_result.get('estimated_stay_days', 3),
+                        'med_used': selected_med,
+                        'qty': int(qty),
+                        'diagnosis_code': ai_result.get('icd10_code', 'Unknown'),
+                        'diagnosis_name': ai_result.get('diagnosis_name', 'Unknown'),
+                        'severity_score': patient['severity_score']
+                    }
+
+                    # Update hospital occupancy
+                    hospitals_df.loc[hospitals_df['hospital_id'] == available_hospital['hospital_id'], 'occupied_beds'] = \
+                        int(available_hospital['occupied_beds']) + 1
+                    save_hospitals(hospitals_df)
+
+                    # Save admission to log
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    admission_df = pd.DataFrame([admission_data])
+                    if os.path.exists(PATIENTS_LOG):
+                        admission_df.to_csv(PATIENTS_LOG, mode='a', header=False, index=False)
+                    else:
+                        admission_df.to_csv(PATIENTS_LOG, index=False)
+
+                    # Update stock
+                    stock_df.loc[stock_df['medicine_name'] == selected_med, 'stock'] -= qty
+                    save_stock(stock_df)
+
+                    st.success(f"Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
+                    st.balloons()
+                    st.session_state.last_admission_id = patient['pid']
+                    st.session_state.admission_complete = True
+                    time.sleep(2)
+                    safe_rerun()
 
 # Inventory management
 st.markdown("---")
@@ -533,6 +698,33 @@ if os.path.exists(PATIENTS_LOG):
         st.error(f"Error loading admission log: {str(e)}")
 else:
     st.info("No admission history available yet")
+
+# Hospital management
+st.markdown("---")
+st.subheader("Hospital Bed Management")
+
+hospitals_df = load_hospitals()
+st.dataframe(hospitals_df, use_container_width=True)
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button('Refresh Hospital Status'):
+        load_hospitals.clear()
+        safe_rerun()
+
+with col2:
+    if st.button('Reset All Occupancy (Clear Beds)'):
+        hospitals_df['occupied_beds'] = 0
+        save_hospitals(hospitals_df)
+        st.success("All beds cleared")
+        safe_rerun()
+
+with col3:
+    if st.button('Simulate Admissions (+2 per ward)'):
+        hospitals_df['occupied_beds'] = (hospitals_df['occupied_beds'] + 2).clip(upper=hospitals_df['total_beds'])
+        save_hospitals(hospitals_df)
+        st.info("Simulated +2 admissions per ward")
+        safe_rerun()
 
 st.markdown("---")
 st.caption(f"AI Hospital Management System • Powered by {CHUTES_MODEL} • ICD-10 Validated • © 2025")
