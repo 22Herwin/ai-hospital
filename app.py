@@ -13,13 +13,36 @@ import concurrent.futures
 import plotly.graph_objects as go
 import plotly.express as px
 
-# Load environment variables
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+# Load .env if present
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
 
-# Chutes AI configuration
-CHUTES_MODEL = os.getenv("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
-CHUTES_API_URL = os.getenv("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
-CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
+def get_config(name: str, default: str | None = None) -> str | None:
+    """
+    Read config in priority: Streamlit secrets -> OS env -> default.
+    """
+    # 1) Streamlit secrets (set in deployment platform or ~/.streamlit/secrets.toml)
+    val = None
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            val = st.secrets[name]
+    except Exception:
+        pass
+    # 2) Environment variables
+    if not val:
+        val = os.getenv(name)
+    # 3) Default
+    return val if val is not None else default
+
+# Chutes AI configuration using secrets + env
+CHUTES_MODEL = get_config("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
+CHUTES_API_URL = get_config("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
+CHUTES_API_TOKEN = get_config("CHUTES_API_TOKEN", None)
+
+# Optional: sidebar hint if missing
+if not CHUTES_API_TOKEN:
+    st.sidebar.warning("CHUTES_API_TOKEN not set (secrets/env). Using fallback rules.")
 
 # Initialize session state
 if 'current_patient' not in st.session_state:

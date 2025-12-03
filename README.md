@@ -1,4 +1,4 @@
-# AI Hospital Management System (2025)
+# AI Hospital Management System
 
 A fully interactive **clinical decision support system** using:
 
