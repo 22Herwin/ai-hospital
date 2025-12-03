@@ -12,27 +12,47 @@ from icd10_loader import lookup_icd10
 import concurrent.futures
 import plotly.graph_objects as go
 import plotly.express as px
+import collections.abc
 
 # Load .env if present
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(env_path):
     load_dotenv(env_path)
 
+def _find_in_secrets(key: str):
+    """Find key in st.secrets at top-level or any nested section."""
+    try:
+        sec = getattr(st, "secrets", {})
+        if not sec:
+            return None
+        # flat
+        if key in sec:
+            return sec[key]
+        # common sections
+        for section in ("chutes", "deepseek", "ollama", "supabase", "who", "who_icd", "icd"):
+            if section in sec and isinstance(sec[section], collections.abc.Mapping) and key in sec[section]:
+                return sec[section][key]
+        # deep search
+        def dfs(d):
+            for _, v in d.items():
+                if isinstance(v, collections.abc.Mapping):
+                    if key in v:
+                        return v[key]
+                    r = dfs(v)
+                    if r is not None:
+                        return r
+            return None
+        return dfs(sec)
+    except Exception:
+        return None
+
 def get_config(name: str, default: str | None = None) -> str | None:
     """
-    Read config in priority: Streamlit secrets -> OS env -> default.
+    Priority: Streamlit secrets (flat or nested) -> OS env -> default.
     """
-    # 1) Streamlit secrets (set in deployment platform or ~/.streamlit/secrets.toml)
-    val = None
-    try:
-        if hasattr(st, "secrets") and name in st.secrets:
-            val = st.secrets[name]
-    except Exception:
-        pass
-    # 2) Environment variables
+    val = _find_in_secrets(name)
     if not val:
         val = os.getenv(name)
-    # 3) Default
     return val if val is not None else default
 
 # Chutes AI configuration using secrets + env
@@ -40,9 +60,19 @@ CHUTES_MODEL = get_config("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
 CHUTES_API_URL = get_config("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
 CHUTES_API_TOKEN = get_config("CHUTES_API_TOKEN", None)
 
-# Optional: sidebar hint if missing
-if not CHUTES_API_TOKEN:
-    st.sidebar.warning("CHUTES_API_TOKEN not set (secrets/env). Using fallback rules.")
+# Export to env so downstream libs can read them (no override if already set)
+if CHUTES_API_TOKEN and not os.getenv("CHUTES_API_TOKEN"):
+    os.environ["CHUTES_API_TOKEN"] = CHUTES_API_TOKEN
+if CHUTES_MODEL and not os.getenv("CHUTES_MODEL"):
+    os.environ["CHUTES_MODEL"] = CHUTES_MODEL
+if CHUTES_API_URL and not os.getenv("CHUTES_API_URL"):
+    os.environ["CHUTES_API_URL"] = CHUTES_API_URL
+
+# Optional diagnostics (remove later)
+with st.sidebar.expander("Secrets diagnostics", expanded=False):
+    st.caption(f"CHUTES_API_TOKEN loaded: {'yes' if bool(CHUTES_API_TOKEN) else 'no'}")
+    st.caption(f"MODEL: {CHUTES_MODEL}")
+    st.caption(f"URL: {CHUTES_API_URL}")
 
 # Initialize session state
 if 'current_patient' not in st.session_state:
