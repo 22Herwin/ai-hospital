@@ -68,12 +68,6 @@ if CHUTES_MODEL and not os.getenv("CHUTES_MODEL"):
 if CHUTES_API_URL and not os.getenv("CHUTES_API_URL"):
     os.environ["CHUTES_API_URL"] = CHUTES_API_URL
 
-# Optional diagnostics (remove later)
-with st.sidebar.expander("Secrets diagnostics", expanded=False):
-    st.caption(f"CHUTES_API_TOKEN loaded: {'yes' if bool(CHUTES_API_TOKEN) else 'no'}")
-    st.caption(f"MODEL: {CHUTES_MODEL}")
-    st.caption(f"URL: {CHUTES_API_URL}")
-
 # Initialize session state
 if 'current_patient' not in st.session_state:
     st.session_state.current_patient = None
@@ -102,7 +96,7 @@ st.set_page_config(page_title='AI Hospital Management System', layout='wide')
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 STOCK_CSV = os.path.join(DATA_DIR, 'medicine_stock.csv')
-HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv')  # <-- new
+HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv') 
 PATIENTS_LOG = os.path.join(DATA_DIR, 'admission_log.csv')
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -329,7 +323,59 @@ def analyze_with_chutes(features: dict) -> dict:
         return fallback_analysis(features)
 
     clinical_note = build_clinical_note(features)
-    from ai_engine import analyze_text_with_chutes
+    # Try to import a helper from ai_engine if available, otherwise provide a local safe implementation
+    try:
+        from ai_engine import analyze_text_with_chutes  # type: ignore
+    except Exception:
+        def analyze_text_with_chutes(prompt: str) -> dict:
+            """
+            Local fallback wrapper that will attempt a direct POST to CHUTES API if token/url present,
+            otherwise return an empty dict so the caller uses fallback_analysis.
+            """
+            # If no token or URL configured, return empty to trigger fallback_analysis
+            if not CHUTES_API_TOKEN or not CHUTES_API_URL:
+                return {}
+
+            try:
+                headers = {
+                    "Authorization": f"Bearer {CHUTES_API_TOKEN}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": CHUTES_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 512
+                }
+                resp = requests.post(CHUTES_API_URL, headers=headers, json=payload, timeout=int(os.getenv("CHUTES_TIMEOUT", "30")))
+                resp.raise_for_status()
+                data = resp.json()
+
+                # Best-effort extraction of assistant content
+                content = None
+                if isinstance(data, dict):
+                    if "choices" in data and data["choices"]:
+                        first = data["choices"][0]
+                        # OpenAI-style response
+                        if isinstance(first, dict):
+                            content = first.get("message", {}).get("content") or first.get("text")
+                    elif "result" in data and isinstance(data["result"], dict):
+                        content = data["result"].get("content")
+
+                if not content:
+                    return {}
+
+                # Try to parse JSON from the assistant if it's JSON-encoded
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        return parsed
+                    # if not a dict, return as text
+                    return {"text": content}
+                except Exception:
+                    return {"text": content}
+            except Exception:
+                # Any error -> return empty to let caller use fallback_analysis
+                return {}
 
     # configurable timeout (set CHUTES_TIMEOUT in .env). Default increased to 30s.
     timeout_seconds = int(os.getenv("CHUTES_TIMEOUT", "30"))
