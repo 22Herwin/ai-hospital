@@ -724,15 +724,24 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                 st.success(f"Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
                 st.info(f"Admission logged | Medicine assigned: {selected_med} x{qty}")
                 
-                # Check capacity AFTER admission and warn if critically low
-                has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
-                if occupancy_pct >= 85:
-                    st.warning(f"POST-ADMISSION ALERT: {capacity_msg}")
+                # FIXED: Calculate occupancy_pct AFTER updating hospitals
+                updated_hospitals_df = load_hospitals()
+                hospital_data = updated_hospitals_df[updated_hospitals_df['hospital_id'] == available_hospital['hospital_id']]
+                if not hospital_data.empty:
+                    updated_total = int(hospital_data.iloc[0]['total_beds'])
+                    updated_occupied = int(hospital_data.iloc[0]['occupied_beds'])
+                    occupancy_pct = int((updated_occupied / updated_total) * 100) if updated_total > 0 else 0
+                    
+                    if occupancy_pct >= 85:
+                        st.warning(f"POST-ADMISSION ALERT: Ward now at {occupancy_pct}% capacity")
                 
                 st.session_state.last_admission_id = patient['pid']
                 st.session_state.admission_complete = True
                 time.sleep(2)
-                safe_rerun()
+                # CRITICAL: Clear all caches to force reload
+                load_hospitals.clear()
+                load_stock.clear()
+                st.rerun()
 
 # Inventory management
 st.markdown("---")
