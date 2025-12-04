@@ -12,61 +12,14 @@ from icd10_loader import lookup_icd10
 import concurrent.futures
 import plotly.graph_objects as go
 import plotly.express as px
-import collections.abc
 
-# Load .env if present
-env_path = os.path.join(os.path.dirname(__file__), ".env")
-if os.path.exists(env_path):
-    load_dotenv(env_path)
+# Load environment variables
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-def _find_in_secrets(key: str):
-    """Find key in st.secrets at top-level or any nested section."""
-    try:
-        sec = getattr(st, "secrets", {})
-        if not sec:
-            return None
-        # flat
-        if key in sec:
-            return sec[key]
-        # common sections
-        for section in ("chutes", "deepseek", "ollama", "supabase", "who", "who_icd", "icd"):
-            if section in sec and isinstance(sec[section], collections.abc.Mapping) and key in sec[section]:
-                return sec[section][key]
-        # deep search
-        def dfs(d):
-            for _, v in d.items():
-                if isinstance(v, collections.abc.Mapping):
-                    if key in v:
-                        return v[key]
-                    r = dfs(v)
-                    if r is not None:
-                        return r
-            return None
-        return dfs(sec)
-    except Exception:
-        return None
-
-def get_config(name: str, default: str | None = None) -> str | None:
-    """
-    Priority: Streamlit secrets (flat or nested) -> OS env -> default.
-    """
-    val = _find_in_secrets(name)
-    if not val:
-        val = os.getenv(name)
-    return val if val is not None else default
-
-# Chutes AI configuration using secrets + env
-CHUTES_MODEL = get_config("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
-CHUTES_API_URL = get_config("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
-CHUTES_API_TOKEN = get_config("CHUTES_API_TOKEN", None)
-
-# Export to env so downstream libs can read them (no override if already set)
-if CHUTES_API_TOKEN and not os.getenv("CHUTES_API_TOKEN"):
-    os.environ["CHUTES_API_TOKEN"] = CHUTES_API_TOKEN
-if CHUTES_MODEL and not os.getenv("CHUTES_MODEL"):
-    os.environ["CHUTES_MODEL"] = CHUTES_MODEL
-if CHUTES_API_URL and not os.getenv("CHUTES_API_URL"):
-    os.environ["CHUTES_API_URL"] = CHUTES_API_URL
+# Chutes AI configuration
+CHUTES_MODEL = os.getenv("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
+CHUTES_API_URL = os.getenv("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
+CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
 
 # Initialize session state
 if 'current_patient' not in st.session_state:
@@ -96,7 +49,7 @@ st.set_page_config(page_title='AI Hospital Management System', layout='wide')
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 STOCK_CSV = os.path.join(DATA_DIR, 'medicine_stock.csv')
-HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv') 
+HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv')  # <-- new
 PATIENTS_LOG = os.path.join(DATA_DIR, 'admission_log.csv')
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -323,59 +276,7 @@ def analyze_with_chutes(features: dict) -> dict:
         return fallback_analysis(features)
 
     clinical_note = build_clinical_note(features)
-    # Try to import a helper from ai_engine if available, otherwise provide a local safe implementation
-    try:
-        from ai_engine import analyze_text_with_chutes  # type: ignore
-    except Exception:
-        def analyze_text_with_chutes(prompt: str) -> dict:
-            """
-            Local fallback wrapper that will attempt a direct POST to CHUTES API if token/url present,
-            otherwise return an empty dict so the caller uses fallback_analysis.
-            """
-            # If no token or URL configured, return empty to trigger fallback_analysis
-            if not CHUTES_API_TOKEN or not CHUTES_API_URL:
-                return {}
-
-            try:
-                headers = {
-                    "Authorization": f"Bearer {CHUTES_API_TOKEN}",
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "model": CHUTES_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 512
-                }
-                resp = requests.post(CHUTES_API_URL, headers=headers, json=payload, timeout=int(os.getenv("CHUTES_TIMEOUT", "30")))
-                resp.raise_for_status()
-                data = resp.json()
-
-                # Best-effort extraction of assistant content
-                content = None
-                if isinstance(data, dict):
-                    if "choices" in data and data["choices"]:
-                        first = data["choices"][0]
-                        # OpenAI-style response
-                        if isinstance(first, dict):
-                            content = first.get("message", {}).get("content") or first.get("text")
-                    elif "result" in data and isinstance(data["result"], dict):
-                        content = data["result"].get("content")
-
-                if not content:
-                    return {}
-
-                # Try to parse JSON from the assistant if it's JSON-encoded
-                try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict):
-                        return parsed
-                    # if not a dict, return as text
-                    return {"text": content}
-                except Exception:
-                    return {"text": content}
-            except Exception:
-                # Any error -> return empty to let caller use fallback_analysis
-                return {}
+    from ai_engine import analyze_text_with_chutes
 
     # configurable timeout (set CHUTES_TIMEOUT in .env). Default increased to 30s.
     timeout_seconds = int(os.getenv("CHUTES_TIMEOUT", "30"))
@@ -767,7 +668,7 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                         help=f"Available stock: {current_stock}"
                     )
 
-                if st.button('CONFIRM ADMISSION', type='primary', use_container_width=True):
+                if st.button('CONFIRM ADMISSION', type='primary', width='stretch'):
                     # Check current capacity before admission
                     has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
                     
@@ -846,7 +747,7 @@ st.subheader("Recent Admissions")
 if os.path.exists(PATIENTS_LOG):
     try:
         log_df = pd.read_csv(PATIENTS_LOG)
-        st.dataframe(log_df.tail(5), width='stretch')
+        st.dataframe(log_df.tail(5))
     except Exception as e:
         st.error(f"Error loading admission log: {str(e)}")
 else:
@@ -1059,81 +960,6 @@ with col3:
         save_hospitals(hospitals_df)
         st.info("Simulated +2 admissions per ward")
         safe_rerun()
-
-# Admission log loading function
-def load_admission_log() -> pd.DataFrame:
-    """Load admission log with error handling and auto-repair."""
-    try:
-        if os.path.exists(PATIENTS_LOG):
-            # Try to read with the correct column count
-            df = pd.read_csv(PATIENTS_LOG)
-            
-            # Check if header matches expected columns
-            expected_cols = ['patient_id', 'admit_time', 'hospital_id', 'hospital_name', 'ward_type', 
-                           'estimated_days', 'med_used', 'qty', 'diagnosis_code', 'diagnosis_name', 'severity_score']
-            
-            if len(df.columns) != len(expected_cols):
-                st.warning(f"Admission log header mismatch. Expected {len(expected_cols)} columns, got {len(df.columns)}. Rebuilding...")
-                os.remove(PATIENTS_LOG)
-                df = pd.DataFrame(columns=expected_cols)
-                df.to_csv(PATIENTS_LOG, index=False)
-                return df
-            
-            return df
-        else:
-            # Create fresh CSV with correct headers
-            expected_cols = ['patient_id', 'admit_time', 'hospital_id', 'hospital_name', 'ward_type', 
-                           'estimated_days', 'med_used', 'qty', 'diagnosis_code', 'diagnosis_name', 'severity_score']
-            df = pd.DataFrame(columns=expected_cols)
-            df.to_csv(PATIENTS_LOG, index=False)
-            return df
-    except Exception as e:
-        st.error(f"Error loading admission log: {e}. Attempting to rebuild...")
-        try:
-            os.remove(PATIENTS_LOG)
-            expected_cols = ['patient_id', 'admit_time', 'hospital_id', 'hospital_name', 'ward_type', 
-                           'estimated_days', 'med_used', 'qty', 'diagnosis_code', 'diagnosis_name', 'severity_score']
-            df = pd.DataFrame(columns=expected_cols)
-            df.to_csv(PATIENTS_LOG, index=False)
-            return df
-        except Exception as e2:
-            st.error(f"Failed to rebuild admission log: {e2}")
-            return pd.DataFrame()
-
-# <-- NEW: Enhanced Admission Log Display
-st.markdown("---")
-st.subheader("Admission Log")
-
-# Load and display admission log
-admission_log_df = load_admission_log()
-if admission_log_df.empty:
-    st.info("No admissions recorded yet.")
-else:
-    # Allow filtering by patient ID and hospital
-    with st.expander("Filter Options", expanded=False):
-        filter_pid = st.text_input("Filter by Patient ID")
-        filter_hospital = st.selectbox("Filter by Hospital", ["All"] + admission_log_df['hospital_name'].unique().tolist())
-        
-        # Apply filters
-        filtered_df = admission_log_df
-        if filter_pid:
-            filtered_df = filtered_df[filtered_df['patient_id'].str.contains(filter_pid, na=False)]
-        if filter_hospital != "All":
-            filtered_df = filtered_df[filtered_df['hospital_name'] == filter_hospital]
-        
-        st.write(f"Showing {len(filtered_df)} admission(s)")
-        st.dataframe(filtered_df, width='stretch')
-        
-        # Download button for filtered log
-        csv = filtered_df.to_csv(index=False)
-        st.download_button(
-            "Download Filtered Log (CSV)",
-            csv,
-            f"admission_log_filtered_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "text/csv",
-            key="download_filtered_log"
-        )
-# <-- END NEW
 
 st.markdown("---")
 st.caption(f"AI Hospital Management System • Powered by {CHUTES_MODEL} • ICD-10 Validated • © 2025")
