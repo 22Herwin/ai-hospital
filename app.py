@@ -721,7 +721,7 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                 stock_df.loc[stock_df['medicine_name'] == selected_med, 'stock'] -= qty
                 save_stock(stock_df)
 
-                st.success(f"atient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
+                st.success(f"Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
                 st.info(f"Admission logged | Medicine assigned: {selected_med} x{qty}")
                 
                 # Check capacity AFTER admission and warn if critically low
