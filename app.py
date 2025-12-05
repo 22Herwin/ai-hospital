@@ -50,7 +50,6 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 STOCK_CSV = os.path.join(DATA_DIR, 'medicine_stock.csv')
 HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv')  # <-- new
-PATIENTS_LOG = os.path.join(DATA_DIR, 'admission_log.csv')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Disease categories for reference
@@ -738,38 +737,34 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                     int(available_hospital['occupied_beds']) + 1
                 save_hospitals(hospitals_df)
 
-                # Save admission to local CSV
-                os.makedirs(DATA_DIR, exist_ok=True)
-                admission_df = pd.DataFrame([admission_data])
-                if os.path.exists(PATIENTS_LOG):
-                    admission_df.to_csv(PATIENTS_LOG, mode='a', header=False, index=False)
-                else:
-                    admission_df.to_csv(PATIENTS_LOG, index=False)
-
-                # SAVE TO SUPABASE (with proper error handling)
+                # SKIP LOCAL CSV - SAVE DIRECTLY TO SUPABASE ONLY
                 supabase_success = False
                 try:
                     from supabase_client import insert_admission
                     result = insert_admission(admission_data)
                     if result:
                         supabase_success = True
+                        st.success(f"✅ Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
+                    else:
+                        st.error("Failed to save to Supabase")
+                        st.stop()
                 except ImportError:
-                    st.warning("Supabase client not available (pip install supabase)")
+                    st.error("Supabase client not available. Install: pip install supabase")
+                    st.stop()
                 except Exception as e:
-                    st.warning(f"Supabase sync error: {type(e).__name__}: {str(e)}")
+                    st.error(f"Supabase error: {type(e).__name__}: {str(e)}")
+                    st.stop()
 
                 # Update stock
                 stock_df.loc[stock_df['medicine_name'] == selected_med, 'stock'] -= qty
                 save_stock(stock_df)
 
-                # Show success messages BEFORE rerun
-                st.success(f"Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
-                st.info(f"Admission logged locally | Medicine assigned: {selected_med} x{qty}")
+                # Show success messages
+                st.success(f"✅ Patient {patient['pid']} admitted")
+                st.info(f"📋 Medicine assigned: {selected_med} x{qty}")
+                st.info(f"🗄️ Data stored in Supabase")
                 
-                if supabase_success:
-                    st.success("Admission synced to Supabase")
-                
-                # FIXED: Calculate occupancy_pct AFTER updating hospitals
+                # Calculate occupancy_pct AFTER updating hospitals
                 updated_hospitals_df = load_hospitals()
                 hospital_data = updated_hospitals_df[updated_hospitals_df['hospital_id'] == available_hospital['hospital_id']]
                 if not hospital_data.empty:
@@ -778,14 +773,14 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
                     occupancy_pct = int((updated_occupied / updated_total) * 100) if updated_total > 0 else 0
                     
                     if occupancy_pct >= 85:
-                        st.warning(f"POST-ADMISSION ALERT: Ward now at {occupancy_pct}% capacity")
+                        st.warning(f"⚠️ Ward now at {occupancy_pct}% capacity")
                 
                 st.session_state.last_admission_id = patient['pid']
                 st.session_state.admission_complete = True
                 
-                time.sleep(3)  # Give time to read messages
+                time.sleep(2)
                 
-                # CRITICAL: Clear all caches to force reload
+                # Clear caches to force reload
                 load_hospitals.clear()
                 load_stock.clear()
                 st.rerun()
@@ -827,18 +822,6 @@ with col3:
         safe_rerun()
 
 st.dataframe(stock_df, width='stretch')
-
-# Admission history
-st.markdown("---")
-st.subheader("Recent Admissions")
-if os.path.exists(PATIENTS_LOG):
-    try:
-        log_df = pd.read_csv(PATIENTS_LOG)
-        st.dataframe(log_df.tail(5))
-    except Exception as e:
-        st.error(f"Error loading admission log: {str(e)}")
-else:
-    st.info("No admission history available yet")
 
 # <-- NEW: Ward Capacity Monitor (Graphical)
 st.markdown("---")
@@ -1068,21 +1051,6 @@ with col1:
         except Exception as e:
             st.error(f"Error fetching from Supabase: {str(e)}")
 
-with col2:
-    if st.button('Sync Local to Supabase'):
-        try:
-            from supabase_client import insert_admission
-            if os.path.exists(PATIENTS_LOG):
-                log_df = pd.read_csv(PATIENTS_LOG)
-                synced_count = 0
-                for _, row in log_df.iterrows():
-                    if insert_admission(row.to_dict()):
-                        synced_count += 1
-                st.success(f"Synced {synced_count}/{len(log_df)} records to Supabase")
-            else:
-                st.info("No local admission log found")
-        except Exception as e:
-            st.error(f"Sync error: {str(e)}")
 
 # View admission timeline
 st.markdown("---")
@@ -1194,7 +1162,7 @@ try:
             # Admissions per hour
             st.write("**Admissions by Hour**")
             admissions_df['admit_time'] = pd.to_datetime(admissions_df['admit_time'], errors='coerce')
-            admissions_df['hour'] = admissions_df['admit_time'].dt.floor('h')
+            admissions_df['hour'] = admissions_df['admit_time'].dt.floor('H')
             admissions_per_hour = admissions_df.groupby('hour').size()
             
             fig_hourly = px.bar(
