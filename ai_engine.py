@@ -4,14 +4,78 @@ import json
 import requests
 from typing import Dict, Any, Optional
 import re
+import collections.abc
 
 BASE_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Chutes AI configuration (defaults can be overridden in .env)
-CHUTES_API_URL = os.getenv("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
-CHUTES_API_TOKEN = os.getenv("CHUTES_API_TOKEN")
-CHUTES_MODEL = os.getenv("CHUTES_MODEL", "deepseek-ai/DeepSeek-R1")
+# ---- Secrets + Env helper ----
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+def _find_in_secrets(key: str) -> Optional[str]:
+    """Find key in st.secrets at top-level or any nested section."""
+    try:
+        if not st or not hasattr(st, "secrets"):
+            return None
+        sec = st.secrets or {}
+        if not sec:
+            return None
+        # flat
+        if key in sec:
+            val = sec[key]
+            if isinstance(val, str):
+                return val
+            # Try to serialize non-string secret values to a string representation
+            try:
+                return json.dumps(val)
+            except Exception:
+                return str(val)
+        # common nested sections
+        for section in ("chutes", "deepseek", "ollama", "supabase"):
+            if section in sec and isinstance(sec[section], collections.abc.Mapping) and key in sec[section]:
+                val = sec[section][key]
+                if isinstance(val, str):
+                    return val
+                try:
+                    return json.dumps(val)
+                except Exception:
+                    return str(val)
+        # deep search
+        def dfs(d):
+            for _, v in d.items():
+                if isinstance(v, collections.abc.Mapping):
+                    if key in v:
+                        return v[key]
+                    r = dfs(v)
+                    if r is not None:
+                        return r
+            return None
+        return dfs(sec)
+    except Exception:
+        return None
+
+def get_config(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Priority: Streamlit secrets (flat or nested) -> OS env -> default."""
+    val = _find_in_secrets(name)
+    if not val:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+# ---- Chutes AI configuration (secrets + env) ----
+CHUTES_API_URL = get_config("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
+CHUTES_API_TOKEN = get_config("CHUTES_API_TOKEN", None)
+CHUTES_MODEL = get_config("CHUTES_MODEL", "unsloth/gemma-3-12b-it")
+
+# Export to env for downstream libs (don’t override if already set)
+if CHUTES_API_URL and not os.getenv("CHUTES_API_URL"):
+    os.environ["CHUTES_API_URL"] = CHUTES_API_URL
+if CHUTES_API_TOKEN and not os.getenv("CHUTES_API_TOKEN"):
+    os.environ["CHUTES_API_TOKEN"] = CHUTES_API_TOKEN
+if CHUTES_MODEL and not os.getenv("CHUTES_MODEL"):
+    os.environ["CHUTES_MODEL"] = CHUTES_MODEL
 
 # Define specific disease categories with STRICT criteria
 HOSPITALIZATION_DISEASES = {
@@ -142,7 +206,7 @@ OUTPUT FORMAT - JSON ONLY:
 IMPORTANT: Be CONSERVATIVE. Only diagnose serious conditions when clear evidence exists.
 """
 
-def call_chutes_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model: str = CHUTES_MODEL, temperature: float = 0.1) -> Optional[Dict[str, Any]]:
+def call_chutes_chat(prompt_user: str, system_prompt: Optional[str] = SYSTEM_PROMPT, model: Optional[str] = CHUTES_MODEL, temperature: float = 0.1) -> Optional[Dict[str, Any]]:
     """
     Calls Chutes AI chat completions endpoint via HTTP.
     Returns parsed JSON dict or None on failure.
@@ -150,6 +214,13 @@ def call_chutes_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model
     if not CHUTES_API_TOKEN:
         # No token configured
         raise RuntimeError("CHUTES_API_TOKEN not set in environment")
+
+    # Ensure we have concrete string values for system_prompt and model to satisfy type checkers
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
+    if model is None:
+        # fallback to the module-level CHUTES_MODEL or a safe literal default
+        model = CHUTES_MODEL or "deepseek-ai/DeepSeek-R1"
 
     headers = {
         "Authorization": f"Bearer {CHUTES_API_TOKEN}",
@@ -168,6 +239,9 @@ def call_chutes_chat(prompt_user: str, system_prompt: str = SYSTEM_PROMPT, model
     }
 
     try:
+        # Ensure CHUTES_API_URL is set (requests.post requires a concrete str/bytes)
+        if not CHUTES_API_URL:
+            raise RuntimeError("CHUTES_API_URL not set in environment")
         r = requests.post(CHUTES_API_URL, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         j = r.json()

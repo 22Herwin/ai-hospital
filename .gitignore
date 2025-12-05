@@ -19,6 +19,8 @@ env/
 
 # Environment variables
 .env
+.env.local
+.env.*.local
 
 # Logs
 *.log
@@ -41,7 +43,6 @@ data/chutes_raw_responses.log
 *.DS_Store
 
 # Supabase credentials
-supabase_client.py
 supabase_schema.sql
 
 # Playwright test outputs (if any)

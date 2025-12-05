@@ -50,7 +50,6 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 STOCK_CSV = os.path.join(DATA_DIR, 'medicine_stock.csv')
 HOSPITALS_CSV = os.path.join(DATA_DIR, 'hospitals.csv')  # <-- new
-PATIENTS_LOG = os.path.join(DATA_DIR, 'admission_log.csv')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Disease categories for reference
@@ -82,20 +81,25 @@ def load_stock():
         if os.path.exists(STOCK_CSV):
             df = pd.read_csv(STOCK_CSV)
             df['stock'] = pd.to_numeric(df['stock'], errors='coerce').fillna(0).astype(int)
-            return df
-        else:
-            # Create comprehensive medicine stock
-            common_meds = [
-                'Amoxicillin 500mg', 'Azithromycin 250mg', 'Paracetamol 500mg',
-                'Aspirin 100mg', 'Clopidogrel 75mg', 'Atorvastatin 20mg',
-                'Meropenem 1g IV', 'Vancomycin 1g IV', 'IV Fluids',
-                'Ceftriaxone 1g IV', 'Oxygen therapy', 'Mannitol IV',
-                'Amlodipine 5mg', 'Lisinopril 10mg', 'Metformin 500mg',
-                'Omeprazole 20mg', 'Ibuprofen 400mg', 'Chlorpheniramine 4mg'
-            ]
-            df = pd.DataFrame({'medicine_name': common_meds, 'stock': [25]*len(common_meds)})
-            df.to_csv(STOCK_CSV, index=False)
-            return df
+            # Only return if non-empty
+            if not df.empty:
+                return df
+        
+        # Always create default stock if missing or empty
+        common_meds = [
+            'Amoxicillin 500mg', 'Azithromycin 250mg', 'Paracetamol 500mg',
+            'Aspirin 100mg', 'Clopidogrel 75mg', 'Atorvastatin 20mg',
+            'Meropenem 1g IV', 'Vancomycin 1g IV', 'IV Fluids',
+            'Ceftriaxone 1g IV', 'Oxygen therapy', 'Mannitol IV',
+            'Amlodipine 5mg', 'Lisinopril 10mg', 'Metformin 500mg',
+            'Omeprazole 20mg', 'Ibuprofen 400mg', 'Chlorpheniramine 4mg'
+        ]
+        df = pd.DataFrame({'medicine_name': common_meds, 'stock': [50]*len(common_meds)})  # Increased stock to 50
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df.to_csv(STOCK_CSV, index=False)
+        st.info("Medicine stock initialized with default inventory")
+        return df
+        
     except Exception as e:
         st.error(f"Error loading stock: {str(e)}")
         return pd.DataFrame(columns=['medicine_name', 'stock'])
@@ -241,7 +245,7 @@ PATIENT CLINICAL PRESENTATION:
 
 Demographics:
 - Age: {features['age']} years
-- Sex: {features.get('sex', 'Not specified')}
+- Sex: {'Unknown' if features.get('sex') not in ['M', 'F'] else features['sex']}
 - BMI: {features['bmi']:.1f}
 
 Vital Signs:
@@ -482,7 +486,36 @@ with st.form('patient_form'):
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        pid = st.text_input('Patient ID', value=f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
+        def generate_sequential_patient_id():
+            """Generate sequential patient ID from log file"""
+            import os
+            counter_file = os.path.join(DATA_DIR, '.patient_counter')
+            
+            try:
+                if os.path.exists(counter_file):
+                    with open(counter_file, 'r') as f:
+                        count = int(f.read().strip())
+                else:
+                    count = 0
+                
+                count += 1
+                with open(counter_file, 'w') as f:
+                    f.write(str(count))
+                
+                return f"P{count:06d}"  # P000001, P000002, etc
+            except Exception:
+                return f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        auto_pid = generate_sequential_patient_id()
+        
+        st.text_input(
+            'Patient ID (Auto-Generated)',
+            value=auto_pid,
+            disabled=True,
+            help="Sequential patient ID"
+        )
+        
+        pid = auto_pid
         age = st.number_input('Age', min_value=0, max_value=120, value=45)
         sex = st.selectbox('Biological Sex', ['M', 'F', 'Other'])
         bmi = st.number_input('BMI', value=24.0, step=0.1, min_value=10.0, max_value=60.0)
@@ -641,117 +674,198 @@ if st.session_state.current_patient and not st.session_state.admission_complete:
             with col2:
                 st.info(f"**Occupancy:** {int((available_hospital['occupied_beds'] / available_hospital['total_beds']) * 100)}%")
 
-            # Filter available medicines
+            # Filter available medicines - IMPROVED
             available_meds = stock_df[
-                stock_df['medicine_name'].apply(lambda x: any(med in x for med in recommended_meds)) &
+                stock_df['medicine_name'].apply(lambda x: any(med.lower() in x.lower() for med in recommended_meds)) &
                 (stock_df['stock'] > 0)
             ]
 
             if available_meds.empty:
-                st.warning("No recommended medicines in stock. Please replenish inventory.")
-            else:
-                col1, col2 = st.columns(2)
-                with col1:
-                    selected_med = st.selectbox(
-                        'Select Medication to Assign',
-                        available_meds['medicine_name'].tolist(),
-                        help="Choose from available in-stock medications"
-                    )
+                # If no exact match, show all available meds
+                st.warning("Exact recommended medicines not in stock. Showing all available medicines:")
+                available_meds = stock_df[stock_df['stock'] > 0]
+                
+                if available_meds.empty:
+                    st.error("No medicines in stock. Please replenish inventory first.")
+                    st.stop()
 
-                with col2:
-                    current_stock = available_meds[available_meds['medicine_name'] == selected_med]['stock'].values[0]
-                    qty = st.number_input(
-                        'Quantity to Assign',
-                        min_value=1,
-                        max_value=int(current_stock),
-                        value=1,
-                        help=f"Available stock: {current_stock}"
-                    )
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_med = st.selectbox(
+                    'Select Medication to Assign',
+                    available_meds['medicine_name'].tolist(),
+                    help="Choose from available in-stock medications"
+                )
 
-                if st.button('CONFIRM ADMISSION', type='primary', use_container_width=True):
-                    # Check current capacity before admission
-                    has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
-                    
-                    st.info(capacity_msg)
-                    
-                    if not has_capacity:
-                        st.error(f"Cannot admit: {capacity_msg}")
-                        st.stop()
-                    
-                    # Create admission record with hospital info
-                    admission_data = {
-                        'patient_id': patient['pid'],
-                        'admit_time': patient['timestamp'].isoformat(),
-                        'hospital_id': available_hospital['hospital_id'],
-                        'hospital_name': available_hospital['hospital_name'],
-                        'ward_type': available_hospital['ward_type'],
-                        'estimated_days': ai_result.get('estimated_stay_days', 3),
-                        'med_used': selected_med,
-                        'qty': int(qty),
-                        'diagnosis_code': ai_result.get('icd10_code', 'Unknown'),
-                        'diagnosis_name': ai_result.get('diagnosis_name', 'Unknown'),
-                        'severity_score': patient['severity_score']
-                    }
+            with col2:
+                current_stock = available_meds[available_meds['medicine_name'] == selected_med]['stock'].values[0]
+                qty = st.number_input(
+                    'Quantity to Assign',
+                    min_value=1,
+                    max_value=int(current_stock),
+                    value=1,
+                    help=f"Available stock: {current_stock}"
+                )
+            
+            # NEW: Admission Date Planning
+            st.write("**Planned Admission Schedule**")
+            col_date1, col_date2, col_date3 = st.columns(3)
+            
+            with col_date1:
+                admission_date = st.date_input(
+                    "Admission Date",
+                    value=datetime.date.today(),
+                    min_value=datetime.date.today(),
+                    help="Date when patient will be admitted"
+                )
+            
+            with col_date2:
+                admission_time = st.time_input(
+                    "Admission Time",
+                    value=datetime.time(hour=9, minute=0),
+                    help="Time of admission"
+                )
+            
+            with col_date3:
+                discharge_days = st.number_input(
+                    "Estimated Length of Stay (days)",
+                    min_value=1,
+                    max_value=90,
+                    value=ai_result.get('estimated_stay_days', 3),
+                    help="How many days will patient be admitted?"
+                )
+            
+            # Calculate estimated discharge date
+            admission_datetime = datetime.datetime.combine(admission_date, admission_time)
+            estimated_discharge = admission_date + datetime.timedelta(days=int(discharge_days))
+            
+            col_summary1, col_summary2 = st.columns(2)
+            with col_summary1:
+                st.info(f"📅 **Admission:** {admission_date.strftime('%Y-%m-%d (%A)')} at {admission_time.strftime('%H:%M')}")
+            
+            with col_summary2:
+                st.info(f"📅 **Est. Discharge:** {estimated_discharge.strftime('%Y-%m-%d (%A)')} ({int(discharge_days)} days)")
 
-                    # Update hospital occupancy
-                    hospitals_df.loc[hospitals_df['hospital_id'] == available_hospital['hospital_id'], 'occupied_beds'] = \
-                        int(available_hospital['occupied_beds']) + 1
-                    save_hospitals(hospitals_df)
+            if st.button('CONFIRM ADMISSION', type='primary', width='stretch'):
+                # Check current capacity before admission
+                has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
+                
+                st.info(capacity_msg)
+                
+                if not has_capacity:
+                    st.error(f"Cannot admit: {capacity_msg}")
+                    st.stop()
+                
+                # Create admission record with hospital info AND DATE PLANNING
+                admission_data = {
+                    'patient_id': patient['pid'],
+                    'admit_time': admission_datetime.isoformat(),  # Use planned admission time
+                    'planned_admission_date': admission_date.isoformat(),
+                    'planned_admission_time': admission_time.isoformat(),
+                    'estimated_discharge_date': estimated_discharge.isoformat(),
+                    'length_of_stay_days': int(discharge_days),
+                    'hospital_id': available_hospital['hospital_id'],
+                    'hospital_name': available_hospital['hospital_name'],
+                    'ward_type': available_hospital['ward_type'],
+                    'estimated_days': ai_result.get('estimated_stay_days', 3),
+                    'med_used': selected_med,
+                    'qty': int(qty),
+                    'diagnosis_code': ai_result.get('icd10_code', 'Unknown'),
+                    'diagnosis_name': ai_result.get('diagnosis_name', 'Unknown'),
+                    'severity_score': patient['severity_score']
+                }
 
-                    # Save admission to log
-                    os.makedirs(DATA_DIR, exist_ok=True)
-                    admission_df = pd.DataFrame([admission_data])
-                    if os.path.exists(PATIENTS_LOG):
-                        admission_df.to_csv(PATIENTS_LOG, mode='a', header=False, index=False)
+                # Update hospital occupancy
+                hospitals_df.loc[hospitals_df['hospital_id'] == available_hospital['hospital_id'], 'occupied_beds'] = \
+                    int(available_hospital['occupied_beds']) + 1
+                save_hospitals(hospitals_df)
+
+                # SKIP LOCAL CSV - SAVE DIRECTLY TO SUPABASE ONLY
+                supabase_success = False
+                try:
+                    from supabase_client import insert_admission
+                    result = insert_admission(admission_data)
+                    if result:
+                        supabase_success = True
+                        st.success(f"✅ Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
                     else:
-                        admission_df.to_csv(PATIENTS_LOG, index=False)
+                        st.error("Failed to save to Supabase")
+                        st.stop()
+                except ImportError:
+                    st.error("Supabase client not available. Install: pip install supabase")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"Supabase error: {type(e).__name__}: {str(e)}")
+                    st.stop()
 
-                    # Update stock
-                    stock_df.loc[stock_df['medicine_name'] == selected_med, 'stock'] -= qty
-                    save_stock(stock_df)
+                # Update stock
+                stock_df.loc[stock_df['medicine_name'] == selected_med, 'stock'] -= qty
+                save_stock(stock_df)
 
-                    st.success(f"Patient {patient['pid']} admitted to {admission_data['hospital_name']} ({admission_data['ward_type']} Ward)")
+                # Show success messages
+                st.success(f"Patient {patient['pid']} admitted")
+                st.info(f"Medicine assigned: {selected_med} x{qty}")
+                st.info(f"Admission: {admission_date.strftime('%Y-%m-%d')} → Discharge: {estimated_discharge.strftime('%Y-%m-%d')} ({int(discharge_days)} days)")
+                st.info(f"Data stored in Supabase")
+                
+                # Calculate occupancy_pct AFTER updating hospitals
+                updated_hospitals_df = load_hospitals()
+                hospital_data = updated_hospitals_df[updated_hospitals_df['hospital_id'] == available_hospital['hospital_id']]
+                if not hospital_data.empty:
+                    updated_total = int(hospital_data.iloc[0]['total_beds'])
+                    updated_occupied = int(hospital_data.iloc[0]['occupied_beds'])
+                    occupancy_pct = int((updated_occupied / updated_total) * 100) if updated_total > 0 else 0
                     
-                    # Check capacity AFTER admission and warn if critically low
-                    has_capacity, capacity_msg = check_ward_capacity_and_alert(requested_ward, hospitals_df)
                     if occupancy_pct >= 85:
-                        st.warning(f"POST-ADMISSION ALERT: {capacity_msg}")
-                    
-                    st.balloons()
-                    st.session_state.last_admission_id = patient['pid']
-                    st.session_state.admission_complete = True
-                    time.sleep(2)
-                    safe_rerun()
+                        st.warning(f"Ward now at {occupancy_pct}% capacity")
+                
+                st.session_state.last_admission_id = patient['pid']
+                st.session_state.admission_complete = True
+                
+                time.sleep(2)
+                
+                # Clear caches to force reload
+                load_hospitals.clear()
+                load_stock.clear()
+                st.rerun()
 
 # Inventory management
 st.markdown("---")
 st.subheader("Medicine Inventory Management")
 
 stock_df = load_stock()
-st.dataframe(stock_df)
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
     if st.button('Refresh Inventory'):
         load_stock.clear()
         safe_rerun()
-with col2:
-    if st.button('Replenish All Stock (+20 units)'):
-        stock_df['stock'] = stock_df['stock'] + 20
-        save_stock(stock_df)
-        st.success("All stock replenished by 20 units")
 
-# Admission history
-st.markdown("---")
-st.subheader("Recent Admissions")
-if os.path.exists(PATIENTS_LOG):
-    try:
-        log_df = pd.read_csv(PATIENTS_LOG)
-        st.dataframe(log_df.tail(5))
-    except Exception as e:
-        st.error(f"Error loading admission log: {str(e)}")
-else:
-    st.info("No admission history available yet")
+with col2:
+    if st.button('Replenish All Stock (+50 units)'):
+        stock_df['stock'] = stock_df['stock'] + 50
+        save_stock(stock_df)
+        st.success("All stock replenished by 50 units")
+        load_stock.clear()
+        safe_rerun()
+
+with col3:
+    if st.button('Reset to Default (50 units each)'):
+        common_meds = [
+            'Amoxicillin 500mg', 'Azithromycin 250mg', 'Paracetamol 500mg',
+            'Aspirin 100mg', 'Clopidogrel 75mg', 'Atorvastatin 20mg',
+            'Meropenem 1g IV', 'Vancomycin 1g IV', 'IV Fluids',
+            'Ceftriaxone 1g IV', 'Oxygen therapy', 'Mannitol IV',
+            'Amlodipine 5mg', 'Lisinopril 10mg', 'Metformin 500mg',
+            'Omeprazole 20mg', 'Ibuprofen 400mg', 'Chlorpheniramine 4mg'
+        ]
+        stock_df = pd.DataFrame({'medicine_name': common_meds, 'stock': [50]*len(common_meds)})
+        save_stock(stock_df)
+        st.success("Stock reset to defaults")
+        load_stock.clear()
+        safe_rerun()
+
+st.dataframe(stock_df, width='stretch')
 
 # <-- NEW: Ward Capacity Monitor (Graphical)
 st.markdown("---")
@@ -939,7 +1053,7 @@ st.markdown("---")
 st.subheader("Hospital Bed Management")
 
 hospitals_df = load_hospitals()
-st.dataframe(hospitals_df, use_container_width=True)
+st.dataframe(hospitals_df, width='stretch')
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -961,80 +1075,336 @@ with col3:
         st.info("Simulated +2 admissions per ward")
         safe_rerun()
 
-# Admission log loading function
-def load_admission_log() -> pd.DataFrame:
-    """Load admission log with error handling and auto-repair."""
-    try:
-        if os.path.exists(PATIENTS_LOG):
-            # Try to read with the correct column count
-            df = pd.read_csv(PATIENTS_LOG)
-            
-            # Check if header matches expected columns
-            expected_cols = ['patient_id', 'admit_time', 'hospital_id', 'hospital_name', 'ward_type', 
-                           'estimated_days', 'med_used', 'qty', 'diagnosis_code', 'diagnosis_name', 'severity_score']
-            
-            if len(df.columns) != len(expected_cols):
-                st.warning(f"Admission log header mismatch. Expected {len(expected_cols)} columns, got {len(df.columns)}. Rebuilding...")
-                os.remove(PATIENTS_LOG)
-                df = pd.DataFrame(columns=expected_cols)
-                df.to_csv(PATIENTS_LOG, index=False)
-                return df
-            
-            return df
-        else:
-            # Create fresh CSV with correct headers
-            expected_cols = ['patient_id', 'admit_time', 'hospital_id', 'hospital_name', 'ward_type', 
-                           'estimated_days', 'med_used', 'qty', 'diagnosis_code', 'diagnosis_name', 'severity_score']
-            df = pd.DataFrame(columns=expected_cols)
-            df.to_csv(PATIENTS_LOG, index=False)
-            return df
-    except Exception as e:
-        st.error(f"Error loading admission log: {e}. Attempting to rebuild...")
+# View Supabase admissions
+st.markdown("---")
+st.subheader("Supabase Admissions Sync")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button('Fetch from Supabase'):
         try:
-            os.remove(PATIENTS_LOG)
-            expected_cols = ['patient_id', 'admit_time', 'hospital_id', 'hospital_name', 'ward_type', 
-                           'estimated_days', 'med_used', 'qty', 'diagnosis_code', 'diagnosis_name', 'severity_score']
-            df = pd.DataFrame(columns=expected_cols)
-            df.to_csv(PATIENTS_LOG, index=False)
-            return df
-        except Exception as e2:
-            st.error(f"Failed to rebuild admission log: {e2}")
-            return pd.DataFrame()
+            from supabase_client import get_all_admissions
+            admissions = get_all_admissions()
+            if admissions:
+                admissions_df = pd.DataFrame(admissions)
+                st.dataframe(admissions_df, width='stretch')
+                st.success(f"Synced {len(admissions)} admissions found in Supabase")
+            else:
+                st.info("No admissions in Supabase yet")
+        except Exception as e:
+            st.error(f"Error fetching from Supabase: {str(e)}")
 
-# <-- NEW: Enhanced Admission Log Display
+
+# View admission timeline
 st.markdown("---")
-st.subheader("Admission Log")
+st.subheader("Patient Admission Timeline")
 
-# Load and display admission log
-admission_log_df = load_admission_log()
-if admission_log_df.empty:
-    st.info("No admissions recorded yet.")
-else:
-    # Allow filtering by patient ID and hospital
-    with st.expander("Filter Options", expanded=False):
-        filter_pid = st.text_input("Filter by Patient ID")
-        filter_hospital = st.selectbox("Filter by Hospital", ["All"] + admission_log_df['hospital_name'].unique().tolist())
+try:
+    from supabase_client import get_all_admissions
+    import pandas as pd
+    
+    admissions = get_all_admissions()
+    
+    if admissions:
+        admissions_df = pd.DataFrame(admissions)
         
-        # Apply filters
-        filtered_df = admission_log_df
-        if filter_pid:
-            filtered_df = filtered_df[filtered_df['patient_id'].str.contains(filter_pid, na=False)]
-        if filter_hospital != "All":
-            filtered_df = filtered_df[filtered_df['hospital_name'] == filter_hospital]
+        # Convert admit_time to datetime
+        admissions_df['admit_time'] = pd.to_datetime(admissions_df['admit_time'], format='ISO8601', utc=True)
+        admissions_df = admissions_df.sort_values('admit_time', ascending=False)  # Most recent first
         
-        st.write(f"Showing {len(filtered_df)} admission(s)")
-        st.dataframe(filtered_df, use_container_width=True)
+        # Extract date components for filtering
+        admissions_df['date'] = admissions_df['admit_time'].dt.date
+        admissions_df['month'] = admissions_df['admit_time'].dt.to_period('M')
+        admissions_df['year'] = admissions_df['admit_time'].dt.year
         
-        # Download button for filtered log
-        csv = filtered_df.to_csv(index=False)
-        st.download_button(
-            "Download Filtered Log (CSV)",
-            csv,
-            f"admission_log_filtered_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "text/csv",
-            key="download_filtered_log"
-        )
-# <-- END NEW
+        # Create tabs for different timeline views
+        timeline_tab1, timeline_tab2, timeline_tab3 = st.tabs(["Recent Admissions", "Analytics", "Hospital Breakdown"])
+        
+        with timeline_tab1:
+            # FILTERS SECTION
+            st.write("**Filter Options**")
+            col_filter1, col_filter2, col_filter3 = st.columns(3)
+            
+            with col_filter1:
+                filter_type = st.radio(
+                    "Filter by:",
+                    ["All", "Date Range", "Specific Month", "Specific Date"],
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+            
+            filtered_df = admissions_df.copy()
+            
+            with col_filter2:
+                if filter_type == "Date Range":
+                    date_range = st.date_input(
+                        "Select date range",
+                        value=(admissions_df['date'].min(), admissions_df['date'].max()),
+                        min_value=admissions_df['date'].min(),
+                        max_value=admissions_df['date'].max(),
+                        key="date_range"
+                    )
+                    if isinstance(date_range, tuple) and len(date_range) == 2:
+                        start_date, end_date = date_range
+                        filtered_df = filtered_df[(filtered_df['date'] >= start_date) & (filtered_df['date'] <= end_date)]
+                    elif isinstance(date_range, tuple):
+                        st.warning("Please select both start and end date")
+                
+                elif filter_type == "Specific Month":
+                    available_months = sorted(admissions_df['month'].unique(), reverse=True)
+                    selected_month = st.selectbox(
+                        "Select month",
+                        available_months,
+                        format_func=lambda x: str(x),
+                        key="month_filter"
+                    )
+                    filtered_df = filtered_df[filtered_df['month'] == selected_month]
+                
+                elif filter_type == "Specific Date":
+                    available_dates = sorted(admissions_df['date'].unique(), reverse=True)
+                    selected_date = st.selectbox(
+                        "Select date",
+                        available_dates,
+                        format_func=lambda x: x.strftime('%Y-%m-%d'),
+                        key="date_filter"
+                    )
+                    filtered_df = filtered_df[filtered_df['date'] == selected_date]
+            
+            with col_filter3:
+                filter_ward = st.multiselect(
+                    "Filter by Ward Type",
+                    admissions_df['ward_type'].unique().tolist(),
+                    default=admissions_df['ward_type'].unique().tolist(),
+                    key="ward_filter"
+                )
+                if filter_ward:
+                    filtered_df = filtered_df[filtered_df['ward_type'].isin(filter_ward)]
+            
+            st.divider()
+            
+            # Display filtered results summary
+            st.write(f"**Showing {len(filtered_df)} admission(s)** out of {len(admissions_df)} total")
+            
+            if len(filtered_df) > 0:
+                # Simple table view of filtered admissions
+                st.write("**Recent Patient Admissions**")
+                
+                recent_admissions = filtered_df.head(10).copy()
+                recent_admissions['admit_time'] = recent_admissions['admit_time'].dt.strftime('%Y-%m-%d %H:%M')
+                
+                # Create display dataframe - FIXED: Use [] not {}
+                display_df = recent_admissions[[
+                    'patient_id', 'admit_time', 'ward_type', 
+                    'diagnosis_code', 'med_used', 'severity_score'
+                ]].copy()
+                
+                display_df.columns = ['Patient ID', 'Admit Time', 'Ward', 'Diagnosis', 'Medication', 'Severity']
+                
+                st.dataframe(display_df, width='stretch', hide_index=True)
+                
+                # Expandable detailed view
+                st.write("**Detailed View (Click to Expand)**")
+                
+                for idx, row in filtered_df.iterrows():                    
+                    with st.expander(f"{row['patient_id']} | {row['admit_time'].strftime('%m-%d %H:%M')} | {row['severity_score']}/25"):
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.write(f"**Patient ID:**\n{row['patient_id']}")
+                            st.write(f"**Admission Time:**\n{row['admit_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                        
+                        with col2:
+                            st.write(f"**Ward Type:**\n{row['ward_type']}")
+                        
+                        with col3:
+                            st.write(f"**Diagnosis Code:**\n{row['diagnosis_code']}")
+                            st.write(f"**Diagnosis Name:**\n{row.get('diagnosis_name', 'Unknown')}")
+                        
+                        st.divider()
+                        
+                        col4, col5, col6 = st.columns(3)
+                        
+                        with col4:
+                            st.write(f"**Medication:**\n{row['med_used']}")
+                        
+                        with col5:
+                            st.write(f"**Quantity:**\n{row['qty']} unit(s)")
+                        
+                        with col6:
+                            st.write(f"**Severity Score:**\n{row['severity_score']}/25")
+                        
+                        st.write(f"**Estimated Stay:** {row['estimated_days']} days")
+            else:
+                st.info("No admissions found for the selected filter(s)")
+        
+        with timeline_tab2:
+            # Apply same filters to analytics
+            col_filter_a1, col_filter_a2 = st.columns(2)
+            
+            with col_filter_a1:
+                filter_type_analytics = st.radio(
+                    "Analytics Filter:",
+                    ["All Time", "Date Range", "Specific Month"],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="analytics_filter"
+                )
+            
+            analytics_df = admissions_df.copy()
+            
+            with col_filter_a2:
+                if filter_type_analytics == "Date Range":
+                    date_range_analytics = st.date_input(
+                        "Select date range for analytics",
+                        value=(admissions_df['date'].min(), admissions_df['date'].max()),
+                        min_value=admissions_df['date'].min(),
+                        max_value=admissions_df['date'].max(),
+                        key="date_range_analytics"
+                    )
+                    if isinstance(date_range_analytics, tuple) and len(date_range_analytics) == 2:
+                        start_date_a, end_date_a = date_range_analytics
+                        analytics_df = analytics_df[(analytics_df['date'] >= start_date_a) & (analytics_df['date'] <= end_date_a)]
+                
+                elif filter_type_analytics == "Specific Month":
+                    available_months_a = sorted(admissions_df['month'].unique(), reverse=True)
+                    selected_month_a = st.selectbox(
+                        "Select month for analytics",
+                        available_months_a,
+                        format_func=lambda x: str(x),
+                        key="month_filter_analytics"
+                    )
+                    analytics_df = analytics_df[analytics_df['month'] == selected_month_a]
+            
+            st.divider()
+            
+            st.write("**Key Metrics**")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Admissions", len(analytics_df), delta="records")
+            
+            with col2:
+                avg_severity = analytics_df['severity_score'].mean() if len(analytics_df) > 0 else 0
+                severity_label = "Critical" if avg_severity >= 15 else "High" if avg_severity >= 10 else "Moderate" if avg_severity >= 5 else "Low"
+                st.metric("Avg Severity", f"{avg_severity:.1f}/25", delta=severity_label)
+            
+            with col3:
+                avg_stay = analytics_df['estimated_days'].mean() if len(analytics_df) > 0 else 0
+                st.metric("Avg Stay (days)", f"{avg_stay:.1f}", delta="inpatient only")
+            
+            with col4:
+                inpatient_count = len(analytics_df[analytics_df['estimated_days'] > 0])
+                inpatient_pct = int((inpatient_count / len(analytics_df) * 100)) if len(analytics_df) > 0 else 0
+                st.metric("Inpatient Rate", f"{inpatient_pct}%", delta=f"{inpatient_count} patients")
+            
+            st.divider()
+            
+            if len(analytics_df) > 0:
+                # Ward distribution
+                st.write("**Distribution by Ward Type**")
+                ward_count = analytics_df['ward_type'].value_counts()
+                
+                fig_ward = px.bar(
+                    x=ward_count.index,
+                    y=ward_count.values,
+                    title="Number of Admissions by Ward Type",
+                    labels={'x': 'Ward Type', 'y': 'Number of Admissions'},
+                    color=ward_count.index,
+                    height=350,
+                    color_discrete_map={
+                        'General': '#1f77b4',
+                        'ICU': '#ff7f0e',
+                        'Neurological': '#2ca02c',
+                        'Outpatient': '#d62728'
+                    }
+                )
+                fig_ward.update_layout(showlegend=False)
+                st.plotly_chart(fig_ward, use_container_width=True)
+                
+                # Top diagnoses
+                st.write("**Top Diagnoses**")
+                diagnosis_count = analytics_df['diagnosis_code'].value_counts().head(8)
+                
+                fig_diagnosis = px.bar(
+                    x=diagnosis_count.values,
+                    y=diagnosis_count.index,
+                    orientation='h',
+                    title="Most Common Diagnoses",
+                    labels={'x': 'Count', 'y': 'Diagnosis Code'},
+                    height=350
+                )
+                st.plotly_chart(fig_diagnosis, use_container_width=True)
+                
+                # Severity distribution
+                st.write("**Severity Score Distribution**")
+                severity_bins = pd.cut(analytics_df['severity_score'], bins=[0, 5, 10, 15, 25], labels=['Low (0-5)', 'Moderate (5-10)', 'High (10-15)', 'Critical (15+)'])
+                severity_count = severity_bins.value_counts().sort_index()
+                
+                fig_severity = px.pie(
+                    values=severity_count.values,
+                    names=severity_count.index,
+                    title="Patient Risk Distribution",
+                    height=350,
+                    color_discrete_sequence=['#2ca02c', '#ffd700', '#ff7f0e', '#d62728']
+                )
+                st.plotly_chart(fig_severity, use_container_width=True)
+            else:
+                st.info("No data available for the selected filter")
+        
+        with timeline_tab3:
+            # Hospital filter
+            col_hosp1, col_hosp2 = st.columns(2)
+            
+            with col_hosp1:
+                hospital_filter = st.multiselect(
+                    "Filter by Hospital",
+                    admissions_df['hospital_name'].unique().tolist(),
+                    default=admissions_df['hospital_name'].unique().tolist(),
+                    key="hospital_filter"
+                )
+            
+            hospital_df = admissions_df[admissions_df['hospital_name'].isin(hospital_filter)]
+            
+            st.write("**Hospital Statistics**")
+            
+            hospital_stats = hospital_df.groupby('hospital_name').agg({
+                'patient_id': 'count',
+                'severity_score': 'mean',
+                'estimated_days': 'mean'
+            }).round(2)
+            
+            hospital_stats.columns = ['Total Admits', 'Avg Severity', 'Avg Stay (days)']
+            hospital_stats = hospital_stats.sort_values('Total Admits', ascending=False)
+            
+            st.dataframe(hospital_stats, width='stretch')
+            
+            st.divider()
+            
+            if len(hospital_df) > 0:
+                # Hospital vs Ward cross-tabulation
+                st.write("**Admissions by Hospital & Ward**")
+                hospital_ward = pd.crosstab(
+                    hospital_df['hospital_name'],
+                    hospital_df['ward_type']
+                )
+                
+                fig_heatmap = px.imshow(
+                    hospital_ward,
+                    labels=dict(x='Ward Type', y='Hospital', color='Admissions'),
+                    title="Hospital-Ward Admission Heatmap",
+                    height=400,
+                    color_continuous_scale='YlOrRd'
+                )
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+                
+                st.dataframe(hospital_ward, width='stretch')
+    
+    else:
+        st.info("📭 No admission data yet. Admissions will appear here as patients are admitted.")
 
-st.markdown("---")
-st.caption(f"AI Hospital Management System • Powered by {CHUTES_MODEL} • ICD-10 Validated • © 2025")
+except ImportError:
+    st.warning("Supabase client not configured. Timeline feature unavailable.")
+except Exception as e:
+    st.error(f"Error loading timeline: {str(e)}")
