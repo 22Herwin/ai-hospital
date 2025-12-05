@@ -1153,7 +1153,7 @@ try:
             st.write("**Detailed Admission Log**")
             
             for idx, row in admissions_df.iterrows():
-                with st.expander(f"🏥 {row['patient_id']} - {row['admit_time'].strftime('%Y-%m-%d %H:%M')} ({row['ward_type']})"):
+                with st.expander(f"{row['patient_id']} - {row['admit_time'].strftime('%Y-%m-%d %H:%M')} ({row['ward_type']})"):
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
@@ -1274,7 +1274,7 @@ try:
             st.dataframe(hospital_ward, width='stretch')
     
     else:
-        st.info("📊 No admission data in Supabase yet. Admissions will appear here as they are recorded.")
+        st.info("No admission data in Supabase yet. Admissions will appear here as they are recorded.")
 
 except ImportError:
     st.error("Supabase client not configured. Timeline feature unavailable.")
