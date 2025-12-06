@@ -19,20 +19,13 @@ A fully interactive **clinical decision support system** using:
 
 The application is now organized into clean, maintainable modules:
 
-- **`app.py`** (260 lines) - Main orchestrator, imports and coordinates all modules
+- **`app.py`** - Main orchestrator, imports and coordinates all modules
 - **`modules/config.py`** - All configuration, constants, and environment variables
 - **`modules/data_manager.py`** - Stock & hospital data operations (CRUD)
 - **`modules/clinical_analysis.py`** - AI diagnosis, severity scoring, fallback rules
 - **`modules/ui_components.py`** - Streamlit UI components (sidebar, forms, display)
 - **`modules/visualizations.py`** - All Plotly charts and dashboards
 - **`modules/admission.py`** - Complete admission workflow & timeline
-
-**Benefits:**
-
-- ✅ Clean separation of concerns
-- ✅ Easy to maintain and test
-- ✅ Reusable components
-- ✅ Original 1400+ line monolith → organized modular structure
 
 ---
 
