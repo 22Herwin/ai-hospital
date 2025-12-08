@@ -16,7 +16,36 @@ from .config import (
 
 def build_clinical_note(features: dict) -> str:
     """Build comprehensive clinical note for AI analysis"""
+    severity_score = features['severity_score']
+    
+    # Determine severity level
+    if severity_score >= 20:
+        severity_level = "CRITICAL - IMMEDIATE INTERVENTION REQUIRED"
+    elif severity_score >= 15:
+        severity_level = "SEVERE - URGENT CARE NEEDED"
+    elif severity_score >= 10:
+        severity_level = "MODERATE - CLOSE MONITORING"
+    else:
+        severity_level = "MILD - ROUTINE MANAGEMENT"
+    
+    # Build active symptoms list
+    active_symptoms = []
+    if features['symptom_fever']:
+        active_symptoms.append(f"Fever ({features['temperature']}°C)")
+    if features['symptom_cough']:
+        active_symptoms.append("Cough")
+    if features['symptom_breathless']:
+        active_symptoms.append("Breathlessness")
+    if features.get('symptom_chest_pain', False):
+        active_symptoms.append("Chest Pain")
+    if features.get('symptom_neuro', False):
+        active_symptoms.append("Neurological Symptoms")
+    
+    symptoms_text = ", ".join(active_symptoms) if active_symptoms else "None reported"
+    
     return f"""
+🚨 CLINICAL SEVERITY: {severity_level} (Score: {severity_score}/25) 🚨
+
 PATIENT CLINICAL PRESENTATION:
 
 Demographics:
@@ -24,28 +53,22 @@ Demographics:
 - Sex: {'Unknown' if features.get('sex') not in ['M', 'F'] else features['sex']}
 - BMI: {features['bmi']:.1f}
 
+⚠️ ACUTE PRESENTING SYMPTOMS: {symptoms_text}
+
 Vital Signs:
-- Blood Pressure: {features['blood_pressure_sys']}/{features['blood_pressure_dia']} mmHg
-- Heart Rate: {features['heart_rate']} bpm
-- Temperature: {features['temperature']} °C
+- Blood Pressure: {features['blood_pressure_sys']}/{features['blood_pressure_dia']} mmHg {'(HYPERTENSIVE CRISIS)' if features['blood_pressure_sys'] > 180 else '(ELEVATED)' if features['blood_pressure_sys'] > 140 else ''}
+- Heart Rate: {features['heart_rate']} bpm {'(TACHYCARDIA)' if features['heart_rate'] > 100 else ''}
+- Temperature: {features['temperature']} °C {'(HIGH FEVER)' if features['temperature'] > 39 else '(FEVER)' if features['temperature'] > 38 else ''}
 
-Presenting Symptoms:
-- Cough: {'Yes' if features['symptom_cough'] else 'No'}
-- Fever: {'Yes' if features['symptom_fever'] else 'No'}
-- Breathlessness: {'Yes' if features['symptom_breathless'] else 'No'}
-- Chest Pain: {'Yes' if features.get('symptom_chest_pain', False) else 'No'}
-- Neurological Symptoms: {'Yes' if features.get('symptom_neuro', False) else 'No'}
+Laboratory Findings:
+- White Blood Cell Count: {features['lab_wbc']} x10^9/L {'(VERY HIGH - SEVERE INFECTION)' if features['lab_wbc'] > 20 else '(ELEVATED - INFECTION)' if features['lab_wbc'] > 11 else '(Normal: 4-11)'}
+- C-Reactive Protein: {features['lab_crp']} mg/L {'(SEVERE INFLAMMATION)' if features['lab_crp'] > 100 else '(HIGH INFLAMMATION)' if features['lab_crp'] > 50 else '(ELEVATED)' if features['lab_crp'] > 10 else '(Normal: <5)'}
 
-Comorbidities:
+Past Medical History (Chronic Conditions):
 - Diabetes: {'Yes' if features['comorbidity_diabetes'] else 'No'}
 - Hypertension: {'Yes' if features['comorbidity_hypertension'] else 'No'}
 
-Laboratory Findings:
-- White Blood Cell Count: {features['lab_wbc']} x10^9/L (Normal: 4-11)
-- C-Reactive Protein: {features['lab_crp']} mg/L (Normal: <5)
-
-Clinical Severity Assessment:
-- Severity Score: {features['severity_score']}/25
+IMPORTANT: Focus on the ACUTE PRESENTATION and severity. If severity is CRITICAL/SEVERE, diagnose the acute condition causing current symptoms, NOT underlying chronic diseases.
 """
 
 
@@ -112,8 +135,26 @@ def fallback_analysis(features: dict) -> dict:
     st.warning("Using fallback clinical rules (AI unavailable)")
 
     # Priority-based rule evaluation (most severe first)
-    # 1. Critical conditions with multiple severe symptoms
-    if features['symptom_fever'] and features['lab_crp'] > 100:
+    # 1. Critical conditions with multiple severe symptoms + high inflammatory markers
+    if features['symptom_fever'] and features['lab_wbc'] > 20 and features['lab_crp'] > 50:
+        diagnosis = {
+            'code': 'A41.9',
+            'name': 'Sepsis, unspecified organism',
+            'meds': ['Meropenem 1g IV q8h', 'Vancomycin 1g IV q12h', 'IV Fluids', 'Norepinephrine if hypotensive'],
+            'ward': 'ICU',
+            'stay': 14
+        }
+    # 1b. Severe respiratory infection with systemic response
+    elif features['symptom_fever'] and features['symptom_cough'] and features['symptom_breathless'] and (features['lab_wbc'] > 15 or features['lab_crp'] > 50):
+        diagnosis = {
+            'code': 'J18.9',
+            'name': 'Severe pneumonia, unspecified organism',
+            'meds': ['Ceftriaxone 2g IV q24h', 'Azithromycin 500mg IV q24h', 'Oxygen therapy', 'IV Fluids'],
+            'ward': 'ICU',
+            'stay': 10
+        }
+    # 1c. Sepsis with elevated CRP only
+    elif features['symptom_fever'] and features['lab_crp'] > 100:
         diagnosis = {
             'code': 'A41.9',
             'name': 'Sepsis, unspecified',
@@ -247,6 +288,17 @@ def analyze_with_chutes(features: dict) -> dict:
                 st.warning("AI returned unexpected result — using fallback rules")
                 return fallback_analysis(features)
 
+            # Check for inappropriate diagnosis based on severity
+            severity_score = features['severity_score']
+            icd_code = ai_result.get('icd10_code', '')
+            is_inpatient = ai_result.get('inpatient', False)
+            
+            # Reject chronic/outpatient diagnoses for critical patients
+            chronic_codes = ['I10', 'E11', 'E10', 'I15', 'E78']  # Hypertension, Diabetes, Hyperlipidemia
+            if severity_score >= 15 and (icd_code in chronic_codes or not is_inpatient):
+                st.warning(f"AI diagnosed '{icd_code}' but severity is {severity_score}/25 (Critical/Severe). Using fallback rules.")
+                return fallback_analysis(features)
+            
             # Verify ICD-10 code
             try:
                 icd_info = lookup_icd10(ai_result['icd10_code'])

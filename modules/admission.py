@@ -147,6 +147,22 @@ def process_admission(patient, ai_result, available_hospital, selected_med, qty,
         st.error(f"Cannot admit: {capacity_msg}")
         st.stop()
     
+    # Get diagnosis info with fallback
+    diagnosis_code = ai_result.get('icd10_code', 'Unknown')
+    diagnosis_name = ai_result.get('diagnosis_name', '')
+    
+    # If diagnosis_name is missing, try to get it from ICD-10 lookup
+    if not diagnosis_name or diagnosis_name == 'Unknown':
+        try:
+            from icd10_loader import lookup_icd10
+            icd_info = lookup_icd10(diagnosis_code)
+            if icd_info and icd_info.get('title'):
+                diagnosis_name = icd_info['title']
+            else:
+                diagnosis_name = 'Unknown diagnosis'
+        except Exception:
+            diagnosis_name = 'Unknown diagnosis'
+    
     # Create admission record
     admission_data = {
         'patient_id': patient['pid'],
@@ -161,8 +177,8 @@ def process_admission(patient, ai_result, available_hospital, selected_med, qty,
         'estimated_days': ai_result.get('estimated_stay_days', 3),
         'med_used': selected_med,
         'qty': int(qty),
-        'diagnosis_code': ai_result.get('icd10_code', 'Unknown'),
-        'diagnosis_name': ai_result.get('diagnosis_name', 'Unknown'),
+        'diagnosis_code': diagnosis_code,
+        'diagnosis_name': diagnosis_name,
         'severity_score': patient['severity_score']
     }
 
@@ -229,11 +245,15 @@ def render_admission_timeline():
     try:
         from sqlite_client import get_all_admissions
         
+        # Only fetch recent admissions by default (limit 50 most recent)
         admissions = get_all_admissions()
         
         if not admissions or len(admissions) == 0:
             st.info("No admission data yet. Admissions will appear here as patients are admitted.")
             return
+        
+        # Limit to most recent 50 for performance
+        admissions = admissions[:50]
         
         admissions_df = pd.DataFrame(admissions)
         
@@ -243,7 +263,9 @@ def render_admission_timeline():
         # Drop rows with invalid dates (can't be parsed)
         valid_dates_mask = admissions_df['admit_time'].notna()
         if not valid_dates_mask.all():
-            st.warning(f"⚠️ {(~valid_dates_mask).sum()} record(s) with invalid dates were filtered out")
+            invalid_count = (~valid_dates_mask).sum()
+            if invalid_count > 0:
+                st.warning(f"⚠️ {invalid_count} record(s) with invalid dates were filtered out")
             admissions_df = admissions_df[valid_dates_mask].copy()
         
         if len(admissions_df) == 0:
@@ -340,11 +362,19 @@ def render_recent_admissions_tab(admissions_df: pd.DataFrame):
             filtered_df = filtered_df[filtered_df['ward_type'].isin(filter_ward)]
     
     st.divider()
-    st.write(f"**Showing {len(filtered_df)} admission(s)** out of {len(admissions_df)} total")
+    
+    # Limit display for performance
+    display_limit = 20
+    total_filtered = len(filtered_df)
+    
+    st.write(f"**Showing {min(display_limit, total_filtered)} of {total_filtered} admission(s)** (from {len(admissions_df)} recent records)")
     
     if len(filtered_df) > 0:
+        # Limit to top 20 for performance
+        display_filtered_df = filtered_df.head(display_limit)
+        
         # Table view
-        recent_admissions = filtered_df.head(10).copy()
+        recent_admissions = display_filtered_df.head(10).copy()
         # Handle NaT values safely
         recent_admissions['admit_time'] = recent_admissions['admit_time'].apply(
             lambda x: x.strftime('%Y-%m-%d %H:%M') if pd.notna(x) else 'N/A'
@@ -358,14 +388,13 @@ def render_recent_admissions_tab(admissions_df: pd.DataFrame):
         display_df.columns = ['Patient ID', 'Admit Time', 'Ward', 'Diagnosis', 'Medication', 'Severity']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         
-        # Expandable detailed view
-        st.write("**Detailed View (Click to Expand)**")
-        for idx, row in filtered_df.iterrows():
+        # Expandable detailed view (limit to 20 for performance)
+        for idx, row in display_filtered_df.iterrows():
             # Safely format dates
             admit_time_short = row['admit_time'].strftime('%m-%d %H:%M') if pd.notna(row['admit_time']) else 'N/A'
             admit_time_full = row['admit_time'].strftime('%Y-%m-%d %H:%M:%S') if pd.notna(row['admit_time']) else 'N/A'
             
-            with st.expander(f"{row['patient_id']} | {admit_time_short} | {row['severity_score']}/25"):
+            with st.expander(f"{row['patient_id']} | {admit_time_short} | {row['severity_score']}/25", expanded=False):
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.write(f"**Patient ID:** {row['patient_id']}")
@@ -374,7 +403,8 @@ def render_recent_admissions_tab(admissions_df: pd.DataFrame):
                     st.write(f"**Ward Type:** {row['ward_type']}")
                 with col3:
                     st.write(f"**Diagnosis Code:** {row['diagnosis_code']}")
-                    diagnosis_name = row.get('diagnosis_name') or 'Not specified'
+                    # Use stored diagnosis_name without expensive ICD-10 lookup
+                    diagnosis_name = row.get('diagnosis_name', 'Not specified')
                     if pd.isna(diagnosis_name) or diagnosis_name == '':
                         diagnosis_name = 'Not specified'
                     st.write(f"**Diagnosis Name:** {diagnosis_name}")

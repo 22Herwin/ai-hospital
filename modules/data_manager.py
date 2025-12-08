@@ -160,14 +160,16 @@ def generate_sequential_patient_id() -> str:
     """Generate sequential patient ID by checking database for highest existing ID"""
     import datetime
     import re
+    import sys
     
     try:
         # Try to get the highest patient ID from database
         try:
-            from sqlite_client import get_all_admissions
-            admissions = get_all_admissions()
+            # Import at runtime to avoid circular dependencies
+            import sqlite_client
+            admissions = sqlite_client.get_all_admissions()
             
-            if admissions:
+            if admissions and len(admissions) > 0:
                 # Extract numeric parts from all patient IDs
                 max_num = 0
                 for admission in admissions:
@@ -178,9 +180,11 @@ def generate_sequential_patient_id() -> str:
                         max_num = max(max_num, num)
                 
                 # Next ID is max + 1
-                next_id = max_num + 1
-                return f"P{next_id:06d}"
-        except Exception:
+                if max_num > 0:
+                    next_id = max_num + 1
+                    return f"P{next_id:06d}"
+        except Exception as db_err:
+            # Database query failed, use counter file
             pass
         
         # Fallback to counter file
@@ -197,6 +201,7 @@ def generate_sequential_patient_id() -> str:
             f.write(str(count))
         
         return f"P{count:06d}"
-    except Exception:
+    except Exception as e:
         # Final fallback: timestamp-based
+        import datetime
         return f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
