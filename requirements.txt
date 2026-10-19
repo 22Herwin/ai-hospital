@@ -19,7 +19,6 @@ python-dateutil>=2.8.2
 
 # Supabase Integration
 supabase>=2.0.0
-postgrest-py>=0.13.0
 
 # Optional: AI & LLM Integration (if using Ollama fallback)
 # ollama>=0.0.11
