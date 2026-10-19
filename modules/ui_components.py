@@ -38,9 +38,10 @@ def initialize_session_state():
 
 def safe_rerun():
     """Safe rerun helper for different Streamlit versions"""
-    rerun = getattr(st, "experimental_rerun", None)
-    if callable(rerun):
-        rerun()
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
     else:
         st.session_state['_safe_rerun_toggle'] = not st.session_state.get('_safe_rerun_toggle', False)
 
@@ -52,12 +53,14 @@ def render_sidebar():
     # Disease reference guide
     with st.sidebar.expander("Disease Reference Guide", expanded=False):
         st.subheader("Hospitalization Required")
-        for code, name in HOSPITALIZATION_DISEASES.items():
-            st.write(f"**{code}**: {name}")
+        for code, val in HOSPITALIZATION_DISEASES.items():
+            display = val["name"] if isinstance(val, dict) else str(val)
+            st.markdown("**" + str(code) + "**: " + display)
 
         st.subheader("Outpatient Management")
-        for code, name in OUTPATIENT_DISEASES.items():
-            st.write(f"**{code}**: {name}")
+        for code, val in OUTPATIENT_DISEASES.items():
+            display = val["name"] if isinstance(val, dict) else str(val)
+            st.markdown("**" + str(code) + "**: " + display)
 
         st.subheader("Healthy")
         st.write(f"**Z00.0**: General medical examination")
